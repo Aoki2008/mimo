@@ -1,0 +1,653 @@
+"""
+OpenAI Chat Completions adapter.
+
+Dual role:
+  * Client-facing adapter for /v1/chat/completions
+  * UpstreamCodec — talks to the MiMo OpenAI-compatible upstream
+
+Streaming uses ``data: <json>\\n\\n`` chunks terminating with ``data: [DONE]``.
+Tool calls stream as incremental ``tool_calls[i].function.arguments`` deltas.
+"""
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any
+
+from gateway.core import (
+    AdapterError,
+    BadRequestError,
+    ContentBlockEnd,
+    ContentBlockStart,
+    FinishReason,
+    GatewayError,
+    InternalContent,
+    InternalEvent,
+    InternalMessage,
+    InternalRequest,
+    InternalTool,
+    MessageEnd,
+    MessageStart,
+    StreamError,
+    TextDelta,
+    ToolCallDelta,
+    Usage,
+)
+
+from .base import ProtocolAdapter
+
+
+# ────────────── finish_reason mapping ──────────────
+
+_OPENAI_TO_IES_FINISH: dict[str, FinishReason] = {
+    "stop": "stop",
+    "length": "length",
+    "tool_calls": "tool_calls",
+    "function_call": "tool_calls",   # legacy
+    "content_filter": "content_filter",
+}
+
+_IES_TO_OPENAI_FINISH: dict[FinishReason, str] = {
+    "stop": "stop",
+    "length": "length",
+    "tool_calls": "tool_calls",
+    "content_filter": "content_filter",
+    "error": "stop",                  # OpenAI has no error finish reason
+}
+
+
+def _map_finish(openai_reason: str | None) -> FinishReason:
+    if openai_reason is None:
+        return "stop"
+    return _OPENAI_TO_IES_FINISH.get(openai_reason, "stop")
+
+
+# ────────────── SSE utility ──────────────
+
+async def iter_sse_data(raw: AsyncIterator[bytes]) -> AsyncIterator[str]:
+    """Yield the JSON payload from each ``data:`` line in an SSE byte stream.
+
+    Handles arbitrary chunk boundaries by buffering until ``\\n``. Skips empty
+    data lines (used as keepalive). Tail without trailing newline is flushed.
+    """
+    buf = b""
+    async for chunk in raw:
+        buf += chunk
+        while b"\n" in buf:
+            line, _, rest = buf.partition(b"\n")
+            buf = rest
+            line = line.rstrip(b"\r")
+            if line.startswith(b"data:"):
+                data = line[5:].lstrip()
+                if data:
+                    yield data.decode("utf-8", errors="replace")
+    line = buf.rstrip(b"\r\n")
+    if line.startswith(b"data:"):
+        data = line[5:].lstrip()
+        if data:
+            yield data.decode("utf-8", errors="replace")
+
+
+# ────────────── Adapter ──────────────
+
+class OpenAIChatAdapter(ProtocolAdapter):
+    """OpenAI Chat Completions: ``/v1/chat/completions``."""
+
+    name = "openai_chat"
+
+    @classmethod
+    def matches_path(cls, path: str) -> bool:
+        return path.endswith("/chat/completions")
+
+    # ============ Request side ============
+
+    def parse_request(self, body: dict[str, Any]) -> InternalRequest:
+        if not isinstance(body, dict):
+            raise BadRequestError("Request body must be a JSON object")
+        model = body.get("model")
+        if not model:
+            raise BadRequestError("Missing 'model'")
+        raw_messages = body.get("messages")
+        if not isinstance(raw_messages, list) or not raw_messages:
+            raise BadRequestError("'messages' must be a non-empty array")
+
+        messages = [self._parse_message(m) for m in raw_messages]
+
+        tools = None
+        if body.get("tools"):
+            tools = [self._parse_tool(t) for t in body["tools"]]
+
+        return InternalRequest(
+            model=model,
+            messages=messages,
+            max_tokens=int(
+                body.get("max_tokens") or body.get("max_completion_tokens") or 4096
+            ),
+            stream=bool(body.get("stream", False)),
+            temperature=body.get("temperature"),
+            top_p=body.get("top_p"),
+            stop=self._parse_stop(body.get("stop")),
+            tools=tools,
+            tool_choice=body.get("tool_choice"),
+            metadata={k: v for k, v in body.items() if k not in _CONSUMED_KEYS},
+        )
+
+    @staticmethod
+    def _parse_stop(stop: Any) -> list[str] | None:
+        if stop is None:
+            return None
+        if isinstance(stop, str):
+            return [stop]
+        if isinstance(stop, list):
+            return [str(s) for s in stop]
+        return None
+
+    @staticmethod
+    def _parse_tool(t: Any) -> InternalTool:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not fn:
+            raise BadRequestError(f"Invalid tool definition: {t}")
+        return InternalTool(
+            name=fn.get("name", ""),
+            description=fn.get("description", ""),
+            input_schema=fn.get("parameters", {}) or {},
+        )
+
+    @staticmethod
+    def _parse_message(m: dict[str, Any]) -> InternalMessage:
+        role = m.get("role", "user")
+        content_blocks: list[InternalContent] = []
+
+        if role == "tool":
+            content_blocks.append(InternalContent(
+                type="tool_result",
+                tool_id=m.get("tool_call_id", ""),
+                tool_output=str(m.get("content", "")),
+            ))
+            return InternalMessage(role="tool", content=content_blocks)
+
+        if role == "assistant":
+            text_content = m.get("content")
+            if isinstance(text_content, str) and text_content:
+                content_blocks.append(InternalContent(type="text", text=text_content))
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                args_raw = fn.get("arguments")
+                tool_input: dict[str, Any] | None = None
+                if isinstance(args_raw, str):
+                    try:
+                        tool_input = json.loads(args_raw) if args_raw else {}
+                    except json.JSONDecodeError:
+                        tool_input = {"_raw": args_raw}
+                elif isinstance(args_raw, dict):
+                    tool_input = args_raw
+                content_blocks.append(InternalContent(
+                    type="tool_use",
+                    tool_id=tc.get("id", ""),
+                    tool_name=fn.get("name", ""),
+                    tool_input=tool_input or {},
+                ))
+            return InternalMessage(role="assistant", content=content_blocks)
+
+        # user / system: string OR list of content blocks
+        raw = m.get("content", "")
+        if isinstance(raw, str):
+            if raw:
+                content_blocks.append(InternalContent(type="text", text=raw))
+        elif isinstance(raw, list):
+            for block in raw:
+                if isinstance(block, str):
+                    content_blocks.append(InternalContent(type="text", text=block))
+                    continue
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    content_blocks.append(InternalContent(type="text", text=block.get("text", "")))
+                elif btype == "image_url":
+                    img = block.get("image_url", {})
+                    url = img.get("url", "") if isinstance(img, dict) else str(img)
+                    if url.startswith("data:"):
+                        try:
+                            header, _, b64 = url.partition(",")
+                            mime = header.split(";")[0].split(":", 1)[-1] or "image/png"
+                            content_blocks.append(InternalContent(
+                                type="image", image_data=b64, image_mime=mime,
+                            ))
+                        except Exception as e:
+                            raise BadRequestError(f"Invalid data URL: {e}") from e
+                    else:
+                        # Remote URL — keep as text reference; upstream may not fetch
+                        content_blocks.append(InternalContent(
+                            type="text", text=f"[image: {url}]",
+                        ))
+        return InternalMessage(role=role, content=content_blocks)
+
+    # ============ Upstream serialization (IES → OpenAI Chat dict) ============
+
+    def serialize_to_upstream(self, req: InternalRequest) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": req.model,
+            "messages": [self._serialize_message(m) for m in req.messages],
+            "max_tokens": req.max_tokens,
+            "stream": req.stream,
+        }
+        if req.temperature is not None:
+            body["temperature"] = req.temperature
+        if req.top_p is not None:
+            body["top_p"] = req.top_p
+        if req.stop:
+            body["stop"] = req.stop
+        if req.tools:
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    },
+                }
+                for t in req.tools
+            ]
+        if req.tool_choice is not None:
+            body["tool_choice"] = req.tool_choice
+        if req.stream:
+            body["stream_options"] = {"include_usage": True}
+        return body
+
+    @staticmethod
+    def _serialize_message(m: InternalMessage) -> dict[str, Any]:
+        if m.role == "tool":
+            tr = next((c for c in m.content if c.type == "tool_result"), None)
+            return {
+                "role": "tool",
+                "tool_call_id": tr.tool_id if tr else "",
+                "content": tr.tool_output if tr else "",
+            }
+
+        if m.role == "assistant":
+            text_parts = [c.text for c in m.content if c.type == "text" and c.text]
+            tool_uses = [c for c in m.content if c.type == "tool_use"]
+            out: dict[str, Any] = {
+                "role": "assistant",
+                "content": "".join(text_parts) if text_parts else None,
+            }
+            if tool_uses:
+                out["tool_calls"] = [
+                    {
+                        "id": tu.tool_id or "",
+                        "type": "function",
+                        "function": {
+                            "name": tu.tool_name or "",
+                            "arguments": json.dumps(tu.tool_input or {}, ensure_ascii=False),
+                        },
+                    }
+                    for tu in tool_uses
+                ]
+            return out
+
+        # system / user
+        has_image = any(c.type == "image" for c in m.content)
+        if not has_image:
+            text = "".join(c.text or "" for c in m.content if c.type == "text")
+            return {"role": m.role, "content": text}
+
+        blocks: list[dict[str, Any]] = []
+        for c in m.content:
+            if c.type == "text" and c.text:
+                blocks.append({"type": "text", "text": c.text})
+            elif c.type == "image":
+                url = f"data:{c.image_mime or 'image/png'};base64,{c.image_data}"
+                blocks.append({"type": "image_url", "image_url": {"url": url}})
+        return {"role": m.role, "content": blocks}
+
+    # ============ Upstream parsing — non-stream ============
+
+    def parse_upstream_response(self, body: bytes) -> list[InternalEvent]:
+        """Parse a non-stream OpenAI Chat completion JSON into IES events.
+
+        Emits the same event sequence a streaming response would, so any
+        downstream adapter can use the same serializer for both modes.
+        """
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            raise AdapterError(f"Upstream returned invalid JSON: {e}") from e
+
+        message_id = data.get("id") or _gen_id()
+        model = data.get("model", "")
+        choices = data.get("choices") or []
+        if not choices:
+            raise AdapterError("Upstream response has no choices")
+
+        choice = choices[0]
+        msg = choice.get("message", {}) or {}
+        finish = _map_finish(choice.get("finish_reason"))
+        u_dict = data.get("usage") or {}
+        usage = Usage(
+            input_tokens=int(u_dict.get("prompt_tokens", 0)),
+            output_tokens=int(u_dict.get("completion_tokens", 0)),
+        )
+
+        events: list[InternalEvent] = [MessageStart(message_id=message_id, model=model)]
+        next_idx = 0
+
+        text = msg.get("content")
+        if isinstance(text, str) and text:
+            events.append(ContentBlockStart(index=next_idx, block_type="text"))
+            events.append(TextDelta(index=next_idx, text=text))
+            events.append(ContentBlockEnd(index=next_idx))
+            next_idx += 1
+
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            tid = tc.get("id", "")
+            tname = fn.get("name", "")
+            args = fn.get("arguments", "")
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            events.append(ContentBlockStart(
+                index=next_idx, block_type="tool_use",
+                tool_id=tid, tool_name=tname,
+            ))
+            if args:
+                events.append(ToolCallDelta(
+                    index=next_idx, tool_id=tid, arguments_delta=args,
+                ))
+            events.append(ContentBlockEnd(index=next_idx))
+            next_idx += 1
+
+        events.append(MessageEnd(finish_reason=finish, usage=usage))
+        return events
+
+    # ============ Upstream parsing — stream ============
+
+    async def parse_upstream_stream(
+        self, raw: AsyncIterator[bytes]
+    ) -> AsyncIterator[InternalEvent]:
+        """Parse OpenAI Chat SSE bytes into IES events.
+
+        State machine: lazy text-block opening, OpenAI tool_call.index ↔ IES
+        block index mapping, finish_reason captured but emitted at end with
+        accumulated usage (which often arrives after finish_reason).
+        """
+        message_started = False
+        text_idx: int | None = None
+        tool_idx_map: dict[int, int] = {}        # OpenAI idx → IES idx
+        tool_id_by_idx: dict[int, str] = {}      # IES idx → tool_id
+        next_block = 0
+        finish_reason: str | None = None
+        usage = Usage()
+        last_message_id = ""
+        last_model = ""
+
+        async for payload in iter_sse_data(raw):
+            if payload.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                yield StreamError(message=f"malformed chunk: {payload[:120]}", recoverable=True)
+                continue
+
+            last_message_id = chunk.get("id") or last_message_id
+            last_model = chunk.get("model") or last_model
+
+            if chunk.get("usage"):
+                u = chunk["usage"]
+                usage = Usage(
+                    input_tokens=int(u.get("prompt_tokens", 0)),
+                    output_tokens=int(u.get("completion_tokens", 0)),
+                )
+
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+
+            if not message_started:
+                yield MessageStart(
+                    message_id=last_message_id or _gen_id(),
+                    model=last_model,
+                )
+                message_started = True
+
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                if text_idx is None:
+                    text_idx = next_block
+                    next_block += 1
+                    yield ContentBlockStart(index=text_idx, block_type="text")
+                yield TextDelta(index=text_idx, text=content)
+
+            for tc in delta.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                oai_idx = tc.get("index", 0)
+                if oai_idx not in tool_idx_map:
+                    ies_idx = next_block
+                    next_block += 1
+                    tool_idx_map[oai_idx] = ies_idx
+                    fn = tc.get("function", {}) or {}
+                    tool_id = tc.get("id") or f"tool_{ies_idx}"
+                    tool_name = fn.get("name", "")
+                    tool_id_by_idx[ies_idx] = tool_id
+                    yield ContentBlockStart(
+                        index=ies_idx, block_type="tool_use",
+                        tool_id=tool_id, tool_name=tool_name,
+                    )
+                ies_idx = tool_idx_map[oai_idx]
+                fn = tc.get("function", {}) or {}
+                args_delta = fn.get("arguments")
+                if isinstance(args_delta, str) and args_delta:
+                    yield ToolCallDelta(
+                        index=ies_idx,
+                        tool_id=tool_id_by_idx[ies_idx],
+                        arguments_delta=args_delta,
+                    )
+
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+
+        if not message_started:
+            yield MessageStart(
+                message_id=last_message_id or _gen_id(),
+                model=last_model,
+            )
+
+        if text_idx is not None:
+            yield ContentBlockEnd(index=text_idx)
+        for ies_idx in sorted(tool_idx_map.values()):
+            yield ContentBlockEnd(index=ies_idx)
+
+        yield MessageEnd(finish_reason=_map_finish(finish_reason), usage=usage)
+
+    # ============ Client serialization (IES → OpenAI Chat output) ============
+
+    def serialize_response_stream(
+        self, events: AsyncIterator[InternalEvent]
+    ) -> AsyncIterator[bytes]:
+        return self._serialize_stream(events)
+
+    async def _serialize_stream(
+        self, events: AsyncIterator[InternalEvent]
+    ) -> AsyncIterator[bytes]:
+        message_id = ""
+        model = ""
+        created = int(time.time())
+        ies_to_oai: dict[int, int] = {}     # IES idx → OpenAI tool_call.index
+        next_oai_tool = 0
+
+        async for ev in events:
+            if isinstance(ev, MessageStart):
+                message_id = ev.message_id
+                model = ev.model
+                yield self._sse_chunk({
+                    "id": message_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }],
+                })
+            elif isinstance(ev, TextDelta):
+                yield self._sse_chunk({
+                    "id": message_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": ev.text},
+                        "finish_reason": None,
+                    }],
+                })
+            elif isinstance(ev, ContentBlockStart) and ev.block_type == "tool_use":
+                oai_idx = next_oai_tool
+                next_oai_tool += 1
+                ies_to_oai[ev.index] = oai_idx
+                yield self._sse_chunk({
+                    "id": message_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": oai_idx,
+                                "id": ev.tool_id or "",
+                                "type": "function",
+                                "function": {"name": ev.tool_name or "", "arguments": ""},
+                            }],
+                        },
+                        "finish_reason": None,
+                    }],
+                })
+            elif isinstance(ev, ToolCallDelta):
+                oai_idx = ies_to_oai.get(ev.index, 0)
+                yield self._sse_chunk({
+                    "id": message_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": oai_idx,
+                                "function": {"arguments": ev.arguments_delta},
+                            }],
+                        },
+                        "finish_reason": None,
+                    }],
+                })
+            elif isinstance(ev, MessageEnd):
+                yield self._sse_chunk({
+                    "id": message_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": _IES_TO_OPENAI_FINISH.get(ev.finish_reason, "stop"),
+                    }],
+                    "usage": {
+                        "prompt_tokens": ev.usage.input_tokens,
+                        "completion_tokens": ev.usage.output_tokens,
+                        "total_tokens": ev.usage.total_tokens,
+                    },
+                })
+                yield b"data: [DONE]\n\n"
+            elif isinstance(ev, StreamError):
+                yield self._sse_chunk({
+                    "id": message_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": f"\n[stream error: {ev.message}]"},
+                        "finish_reason": None,
+                    }],
+                })
+            # ContentBlockStart(text) and ContentBlockEnd are no-ops in OpenAI SSE
+
+    @staticmethod
+    def _sse_chunk(payload: dict[str, Any]) -> bytes:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+    def serialize_response(self, events: list[InternalEvent]) -> bytes:
+        message_id = ""
+        model = ""
+        text_parts: list[str] = []
+        tool_calls_by_idx: dict[int, dict[str, Any]] = {}
+        finish: FinishReason = "stop"
+        usage = Usage()
+
+        for ev in events:
+            if isinstance(ev, MessageStart):
+                message_id = ev.message_id
+                model = ev.model
+            elif isinstance(ev, ContentBlockStart) and ev.block_type == "tool_use":
+                tool_calls_by_idx[ev.index] = {
+                    "id": ev.tool_id or "",
+                    "type": "function",
+                    "function": {"name": ev.tool_name or "", "arguments": ""},
+                }
+            elif isinstance(ev, TextDelta):
+                text_parts.append(ev.text)
+            elif isinstance(ev, ToolCallDelta):
+                if ev.index in tool_calls_by_idx:
+                    tool_calls_by_idx[ev.index]["function"]["arguments"] += ev.arguments_delta
+            elif isinstance(ev, MessageEnd):
+                finish = ev.finish_reason
+                usage = ev.usage
+
+        msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(text_parts) if text_parts else None,
+        }
+        if tool_calls_by_idx:
+            msg["tool_calls"] = [tool_calls_by_idx[i] for i in sorted(tool_calls_by_idx)]
+
+        body = {
+            "id": message_id or _gen_id(),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": msg,
+                "finish_reason": _IES_TO_OPENAI_FINISH.get(finish, "stop"),
+            }],
+            "usage": {
+                "prompt_tokens": usage.input_tokens,
+                "completion_tokens": usage.output_tokens,
+                "total_tokens": usage.total_tokens,
+            },
+        }
+        return json.dumps(body, ensure_ascii=False).encode()
+
+    # ============ Error envelope ============
+
+    def error_envelope(self, err: GatewayError) -> bytes:
+        return json.dumps({
+            "error": {
+                "message": err.message,
+                "type": err.error_code,
+                "code": err.error_code,
+            }
+        }).encode()
+
+
+# ────────────── helpers ──────────────
+
+_CONSUMED_KEYS = frozenset({
+    "model", "messages", "max_tokens", "max_completion_tokens", "stream",
+    "temperature", "top_p", "stop", "tools", "tool_choice",
+    # Things we don't pass through (yet)
+    "n", "stream_options", "logprobs", "top_logprobs", "logit_bias",
+    "presence_penalty", "frequency_penalty", "user", "response_format",
+    "seed", "service_tier",
+})
+
+
+def _gen_id() -> str:
+    return f"chatcmpl-{uuid.uuid4().hex[:24]}"

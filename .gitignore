@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Environments
+.env
+.venv
+venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# Claude local config (CONTAINS CREDENTIALS — never commit)
+.claude/settings.local.json
+
+# Account cookies (sensitive — auth tokens)
+accounts/
+claw/mimo_cookies.json
+
+# Runtime data (databases, deploy state, logs)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/auto_deploy.json
+data/deploy_history/
+data/deploy_logs/
+
+# Gateway runtime config (often contains secrets)
+gateway.yaml
+
+# Archives / backups
+*.zip
+*.tar.gz
+*.bak
+
+# Scratch
+.scratch_*
