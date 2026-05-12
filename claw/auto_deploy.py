@@ -48,6 +48,18 @@ JUMP_USER = "root"
 # otherwise need root↔root key trust on the same host.
 _JUMP_LOCAL = os.environ.get("MIMO_JUMP_LOCAL") in ("1", "true", "yes")
 
+# Set MIMO_DEBUG_CLAW=1 to log Claw's WS replies in full instead of the
+# 200-char preview. Necessary for diagnosing whether Claw executed every
+# step of the deploy doc (esp. the tunnel-establishment + keepalive
+# tail) or stopped partway.
+_DEBUG_CLAW = os.environ.get("MIMO_DEBUG_CLAW") in ("1", "true", "yes")
+
+
+def _fmt_claw_reply(reply: str) -> str:
+    if _DEBUG_CLAW:
+        return reply
+    return reply[:200] + "..." if len(reply) > 200 else reply
+
 # Stale-deploy entries (state ∈ done/error/cancelled) older than this are
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
 _STALE_AFTER_S = 300
@@ -150,7 +162,12 @@ class DeployLogger:
         self.lines.append(line)
         if len(self.lines) > _LOG_LINES_MAX:
             self.lines = self.lines[-_LOG_LINES_MAX:]
-        print(f"[deploy:{self.account}] {line}", flush=True)
+        # Stdout encoding on Windows defaults to GBK and can't render ✅/❌/⚠️;
+        # let the print fail silently rather than crash the deploy.
+        try:
+            print(f"[deploy:{self.account}] {line}", flush=True)
+        except (UnicodeEncodeError, OSError):
+            pass
         try:
             with open(self._file, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -548,7 +565,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             log.log(f"❌ Claw 通信失败: {err3}")
             mark_finished("error", history_status="error")
             return
-        log.log(f"Claw 回复: {reply3[:200]}...")
+        log.log(f"Claw 回复: {_fmt_claw_reply(reply3)}")
         if cancelled():
             mark_finished("cancelled", history_status="cancelled")
             return
@@ -569,7 +586,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                 log.log(f"❌ 重试 Claw 通信失败: {err_retry}")
                 mark_finished("error", history_status="error")
                 return
-            log.log(f"Claw 回复: {reply_retry[:200]}...")
+            log.log(f"Claw 回复: {_fmt_claw_reply(reply_retry)}")
             public_key = _parse_ssh_key(reply_retry)
         if not public_key:
             log.log("❌ 无法从 Claw 回复中提取 SSH 公钥")
@@ -609,7 +626,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         if err6:
             log.log(f"⚠️ 通知 Claw 失败 (不阻断): {err6}")
         else:
-            log.log(f"Claw 回复: {reply6[:200]}...")
+            log.log(f"Claw 回复: {_fmt_claw_reply(reply6)}")
         if cancelled():
             mark_finished("cancelled", history_status="cancelled")
             return
