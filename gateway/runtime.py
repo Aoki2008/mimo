@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,8 @@ _PROBE_FAILURE_THRESHOLD = 3
 _PROBE_COOLDOWN_S = 30.0
 _PROBE_CONCURRENCY = 10
 _DEFAULT_REQUEST_TIMEOUT_S = 600.0
+_CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
 # ────────────── singleton state ──────────────
 
@@ -327,13 +331,65 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
     raw = await request.body()
     if not raw:
         raise BadRequestError("Empty request body")
+
+    text, encoding = _decode_json_body(raw, request.headers.get("content-type", ""))
     try:
-        data = json.loads(raw)
+        data = json.loads(text)
     except json.JSONDecodeError as e:
         raise BadRequestError(f"Invalid JSON: {e}") from e
     if not isinstance(data, dict):
         raise BadRequestError("Request body must be a JSON object")
+    if encoding not in {"utf-8", "utf-8-sig"}:
+        logger.info("Decoded JSON request body using %s", encoding)
     return data
+
+
+def _decode_json_body(raw: bytes, content_type: str = "") -> tuple[str, str]:
+    """Decode a JSON request body without leaking ``UnicodeDecodeError``.
+
+    JSON clients should send UTF-8, but some callers incorrectly post bodies
+    encoded as GBK/GB18030 (common with Chinese text).  Try the declared
+    charset first, then UTF-8 variants, and finally GB18030 as a compatibility
+    fallback.  If all decoders fail, surface a protocol-level 400 instead of an
+    unhandled server exception.
+    """
+    encodings = _candidate_json_encodings(content_type)
+    failures: list[str] = []
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError as e:
+            failures.append(f"{encoding}: byte 0x{raw[e.start]:02x} at position {e.start}")
+        except LookupError:
+            failures.append(f"{encoding}: unknown encoding")
+
+    detail = "; ".join(failures[:3])
+    raise BadRequestError(
+        "Invalid request body encoding: expected UTF-8 JSON"
+        + (f" ({detail})" if detail else "")
+    )
+
+
+def _candidate_json_encodings(content_type: str) -> list[str]:
+    declared = _declared_charset(content_type)
+    candidates: list[str] = []
+    if declared:
+        candidates.append(declared)
+    candidates.extend(["utf-8-sig", "utf-8", "gb18030"])
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for encoding in candidates:
+        normalized = encoding.strip().strip('"').lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    return out
+
+
+def _declared_charset(content_type: str) -> str:
+    match = _CHARSET_RE.search(content_type or "")
+    return match.group(1).strip() if match else ""
 
 
 def _error_response(adapter: ProtocolAdapter, err: GatewayError) -> Response:
