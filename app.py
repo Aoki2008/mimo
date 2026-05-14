@@ -391,11 +391,13 @@ async def api_status():
     # Cookie status
     cookies = load_cookies()
     ph_found = any(c["name"] == "xiaomichatbot_ph" for c in cookies)
+    current_name = _get_current_account_name()
+    current_file = (ACCOUNTS_DIR / f"{current_name}.json") if current_name else None
     result["cookies"] = {
         "status": "ok" if ph_found and cookies else "error",
         "count": len(cookies),
         "has_ph": ph_found,
-        "file_exists": COOKIE_FILE.exists(),
+        "file_exists": bool(current_file and current_file.exists()),
     }
 
     # Claw status
@@ -1214,18 +1216,9 @@ def switch_to_account(account_filename: str) -> bool:
         cookies = data.get("cookies", [])
         if not cookies:
             return False
-        # Write to cookie file
-        cookie_list = []
-        for c in cookies:
-            cookie_list.append({
-                "name": c.get("name", ""),
-                "value": c.get("value", ""),
-                "domain": c.get("domain", ".xiaomimimo.com"),
-                "path": c.get("path", "/"),
-            })
-        COOKIE_FILE.write_text(json.dumps(cookie_list, indent=2, ensure_ascii=False), encoding="utf-8")
-        # Update current account
-        CURRENT_ACCOUNT_FILE.write_text(json.dumps({"current": account_filename}, ensure_ascii=False), encoding="utf-8")
+        # Update current account. Cookies are now stored per account under
+        # accounts/<name>.json; avoid writing the removed legacy COOKIE_FILE.
+        _set_current_account(account_filename)
         return True
     except Exception as e:
         print(f"[switch_to_account] Error: {e}")
@@ -1825,10 +1818,6 @@ async def gateway_proxy(request: Request, path: str):
             {"error": {"message": "Missing or invalid Authorization", "type": "auth_error"}},
             status_code=401,
         )
-
-    # Read body
-    body = await request.body()
-    headers = dict(request.headers)
 
     # Map source path → adapter name (the new pipeline does protocol
     # encoding/decoding bidirectionally — including streaming SSE frames).

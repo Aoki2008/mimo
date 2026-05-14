@@ -253,10 +253,6 @@ class GatewayHandler:
                 details={"status": status},
             )
 
-        # Mark success at stream start; mid-stream failures still surface
-        # via the IES StreamError event.
-        backend.record_success()
-
         ies_events = self._codec.parse_upstream_stream(raw_iter)
         # Tee usage out of the IES stream while it flows to the serializer.
         # Upstream usage typically arrives in the final MessageEnd event,
@@ -281,21 +277,31 @@ class GatewayHandler:
         bid = backend.backend_id
 
         async def counted_chunks() -> AsyncIterator[bytes]:
+            error = ""
+            completed = False
             try:
                 async for chunk in client_bytes:
                     ctx.response_chunks += 1
                     yield chunk
+                completed = True
+            except Exception as e:
+                error = f"stream: {type(e).__name__}: {e}"
+                backend.record_failure(error)
+                raise
             finally:
                 latency_ms = (time.monotonic() - started) * 1000
-                backend.record_latency(latency_ms)
+                if completed:
+                    backend.record_success()
+                    backend.record_latency(latency_ms)
                 backend.dec_in_flight()
                 if recorder is not None:
                     try:
                         recorder.record(
-                            ctx=ctx, backend_id=bid, status_code=status,
+                            ctx=ctx, backend_id=bid, status_code=status if completed else 0,
                             latency_ms=latency_ms,
                             prompt_tokens=captured["prompt"],
                             completion_tokens=captured["completion"],
+                            error=error,
                         )
                     except Exception:
                         pass
