@@ -10,6 +10,8 @@ httpx's exception hierarchy.
 """
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
@@ -21,6 +23,9 @@ from gateway.core import (
     UpstreamError,
     UpstreamTimeoutError,
 )
+
+logger = logging.getLogger(__name__)
+_MAX_LOG_BODY_CHARS = 4000
 
 
 class UpstreamTransport(Protocol):
@@ -94,6 +99,8 @@ class HttpxTransport:
         except httpx.HTTPError as e:
             raise UpstreamError(f"Upstream transport error: {e}") from e
 
+        if resp.status_code >= 400:
+            _log_upstream_http_error(url, resp.status_code, resp.content, body)
         return resp.status_code, resp.content
 
     async def post_stream(
@@ -120,6 +127,11 @@ class HttpxTransport:
             raise UpstreamError(f"Upstream transport error: {e}") from e
 
         status = response.status_code
+        if status >= 400:
+            raw = await response.aread()
+            await ctx_mgr.__aexit__(None, None, None)
+            _log_upstream_http_error(url, status, raw, body)
+            return status, _single_chunk_iter(raw)
 
         async def iter_bytes() -> AsyncIterator[bytes]:
             try:
@@ -129,6 +141,57 @@ class HttpxTransport:
                 await ctx_mgr.__aexit__(None, None, None)
 
         return status, iter_bytes()
+
+
+async def _single_chunk_iter(raw: bytes) -> AsyncIterator[bytes]:
+    if raw:
+        yield raw
+
+
+def _log_upstream_http_error(url: str, status_code: int, raw: bytes, body: dict[str, Any]) -> None:
+    """Log upstream HTTP error details for troubleshooting.
+
+    Request prompts can be sensitive, so the log includes only routing/body shape
+    fields plus the upstream error payload that explains the failure.
+    """
+    logger.error(
+        "Upstream MiMo API returned HTTP %s for %s; request=%s; response=%s",
+        status_code,
+        url,
+        _summarize_request_body(body),
+        _format_response_body(raw),
+    )
+
+
+def _summarize_request_body(body: dict[str, Any]) -> dict[str, Any]:
+    messages = body.get("messages")
+    summary: dict[str, Any] = {
+        "model": body.get("model", ""),
+        "stream": bool(body.get("stream", False)),
+        "keys": sorted(str(k) for k in body.keys()),
+    }
+    if isinstance(messages, list):
+        summary["messages_count"] = len(messages)
+    return summary
+
+
+def _format_response_body(raw: bytes) -> str:
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return "<empty>"
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return _truncate_for_log(text)
+
+    return _truncate_for_log(json.dumps(parsed, ensure_ascii=False, separators=(",", ":")))
+
+
+def _truncate_for_log(text: str) -> str:
+    if len(text) <= _MAX_LOG_BODY_CHARS:
+        return text
+    return text[:_MAX_LOG_BODY_CHARS] + "…<truncated>"
 
 
 def normalize_upstream_exception(e: Exception) -> GatewayError:
