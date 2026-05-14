@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -34,6 +35,20 @@ from gateway.routing import Backend, BackendRegistry, InMemoryDecisionLog, Route
 from gateway.secrets_store import secrets
 from gateway.transport import HttpxTransport
 
+logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
 _PROBE_INTERVAL_S = 60.0
 _PROBE_TIMEOUT_S = 5.0
 _PROBE_FAILURE_THRESHOLD = 3
@@ -47,15 +62,14 @@ _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
 _ROTATION_INTERVAL_S = 50 * 60.0
 _READINESS_INTERVAL_S = 10.0
 _READINESS_REQUIRED_SUCCESSES = 1
-_DRAIN_TIMEOUT_S = 10 * 60.0
+_DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
 _ROTATION_DISABLE_AFTER = 3
-_ROTATION_DISABLED_FOR_S = 30 * 60.0
-_ROTATION_LOOP_INTERVAL_S = 15.0
+_ROTATION_DISABLED_FOR_S = _env_float("GATEWAY_ROTATION_DISABLED_FOR_S", 30 * 60.0)
+_ROTATION_LOOP_INTERVAL_S = _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0)
 
 _READINESS_MAX_STREAM_CHUNKS = 32
 _READINESS_MAX_STREAM_SECONDS = 20.0
 _READINESS_PROMPT = "ping"
-logger = logging.getLogger(__name__)
 
 # ────────────── singleton state ──────────────
 
@@ -514,6 +528,13 @@ def _reap_drained(*, now: float | None = None) -> None:
             continue
         if b.in_flight > 0 and not (b.drain_deadline and n >= b.drain_deadline):
             continue
+        if b.in_flight > 0:
+            logger.warning(
+                "Drain deadline reached for backend %s with %s in-flight request(s); "
+                "removing it from new routing while existing handlers continue draining",
+                b.backend_id,
+                b.in_flight,
+            )
         if b.backend_id in persisted_ids:
             b.mark_standby()
             _persist_backend_runtime_state(b)
@@ -536,7 +557,12 @@ async def _run_readiness_checks(backend: Backend) -> tuple[bool, str, float]:
         ("tool_call", _readiness_tool_call_body),
     )
     for name, body_factory in checks:
-        ok, reason = await _run_one_readiness_check(backend, name, body_factory(backend))
+        try:
+            body = body_factory(backend)
+            ok, reason = await _run_one_readiness_check(backend, name, body)
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            reason = f"{type(e).__name__}: {e}"
         if not ok:
             return False, f"{name}: {reason}", (time.monotonic() - started) * 1000
     return True, "ready", (time.monotonic() - started) * 1000
@@ -568,15 +594,42 @@ async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, 
         )
         if status >= 400:
             return False, f"http {status}: {raw[:200]!r}"
-        if name == "tool_call" and b"tool_calls" not in raw and b"function_call" not in raw:
-            return False, "no tool call in response"
+        if name == "tool_call":
+            ok, reason = _raw_response_has_tool_call(raw)
+            if not ok:
+                return False, reason
         return True, "ok"
     except Exception as e:  # noqa: BLE001
         return False, f"{type(e).__name__}: {e}"
 
 
+def _raw_response_has_tool_call(raw: bytes) -> tuple[bool, str]:
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return False, f"invalid tool-call JSON: {e}"
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list):
+        return False, "tool-call response has no choices"
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        msg = choice.get("message") or {}
+        if not isinstance(msg, dict):
+            continue
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return True, "ok"
+        function_call = msg.get("function_call")
+        if isinstance(function_call, dict) and function_call:
+            return True, "ok"
+    return False, "no tool call in response"
+
+
 def _readiness_model(backend: Backend) -> str:
-    return backend.models[0] if backend.models else "mimo-v2.5-pro"
+    if not backend.models:
+        raise ValueError("backend has no configured models for readiness checks")
+    return backend.models[0]
 
 
 def _readiness_non_stream_body(backend: Backend) -> dict[str, Any]:
@@ -629,7 +682,7 @@ def _persist_backend_runtime_state(backend: Backend) -> None:
             disabled_until=backend.disabled_until,
         )
     except Exception:
-        pass
+        logger.exception("Failed to persist backend state for %s", backend.backend_id)
 
 
 def start_probe() -> None:
@@ -649,15 +702,17 @@ def start_probe() -> None:
 async def shutdown() -> None:
     """Close runtime-owned background resources."""
     global _probe_task, _rotation_task
-    for task_name in ("_probe_task", "_rotation_task"):
-        task = globals()[task_name]
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            globals()[task_name] = None
+    tasks = (_probe_task, _rotation_task)
+    _probe_task = None
+    _rotation_task = None
+    for task in tasks:
+        if task is None:
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     if _transport is not None:
         await _transport.close()
     if _handler is not None:
@@ -703,7 +758,14 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
 
 
 def _decode_json_body(raw: bytes, content_type: str = "") -> tuple[str, str]:
-    """Decode a JSON request body without leaking ``UnicodeDecodeError``."""
+    """Decode a JSON request body without leaking ``UnicodeDecodeError``.
+
+    JSON clients should send UTF-8, but some callers incorrectly post bodies
+    encoded as GBK/GB18030 (common with Chinese text). Try the declared
+    charset first, then UTF-8 variants, and finally GB18030 as a compatibility
+    fallback. If all decoders fail, surface a protocol-level 400 instead of an
+    unhandled server exception.
+    """
     encodings = _candidate_json_encodings(content_type)
     failures: list[str] = []
     for encoding in encodings:
