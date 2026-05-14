@@ -231,7 +231,11 @@ class GatewayHandler:
             ctx.upstream_status = status
 
             if status >= 400:
-                backend.record_failure(f"upstream http {status}")
+                # 4xx normally means the request payload/auth was rejected by
+                # upstream. Do not poison backend health or rotate traffic across
+                # otherwise healthy nodes for client/gateway request-shape bugs.
+                if status >= 500:
+                    backend.record_failure(f"upstream http {status}")
                 self._record_metric(ctx, backend.backend_id, status,
                                     (time.monotonic() - started) * 1000,
                                     error=f"http {status}")
@@ -295,7 +299,8 @@ class GatewayHandler:
                     pass
             except Exception:
                 pass
-            backend.record_failure(f"upstream http {status}")
+            if status >= 500:
+                backend.record_failure(f"upstream http {status}")
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, status,
                                 (time.monotonic() - started) * 1000,

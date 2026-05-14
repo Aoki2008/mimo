@@ -105,3 +105,24 @@ def test_allowed_models_are_enforced_before_routing(monkeypatch):
 
     with pytest.raises(AuthError):
         asyncio.run(handler.handle(ctx, OpenAIChatAdapter(), _body("m")))
+
+
+def test_non_stream_4xx_does_not_mark_backend_failure(monkeypatch):
+    monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
+    backend = Backend(backend_id="a", base_url="http://a", models=["m"])
+    backend.record_success()
+    transport = FakeTransport({"http://a/v1/chat/completions": (400, b"bad request")})
+    metrics = FakeMetrics()
+    handler = GatewayHandler(
+        router=Router(BackendRegistry([backend])),
+        transport=transport,
+        metrics=metrics,
+    )
+
+    from gateway.core import UpstreamError
+    with pytest.raises(UpstreamError):
+        asyncio.run(handler.handle(RequestContext(), OpenAIChatAdapter(), _body()))
+
+    assert backend.total_failures == 0
+    assert backend.health == "alive"
+    assert metrics.rows[0]["status_code"] == 400

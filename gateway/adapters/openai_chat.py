@@ -287,11 +287,13 @@ class OpenAIChatAdapter(ProtocolAdapter):
             elif tool_uses:
                 # MiMo requires reasoning_content to be present in later
                 # thinking-mode tool-call turns. Rehydrate from the gateway
-                # cache when clients dropped this non-standard field; fall
-                # back to an empty string so the field is at least present.
-                out["reasoning_content"] = (
-                    lookup_reasoning(t.tool_id for t in tool_uses) or ""
-                )
+                # cache when clients dropped this non-standard field. Do not
+                # inject an empty string: MiMo expects the *complete* reasoning,
+                # and sending an empty value can turn valid non-thinking tool
+                # histories into 400s.
+                cached_reasoning = lookup_reasoning(t.tool_id for t in tool_uses)
+                if cached_reasoning:
+                    out["reasoning_content"] = cached_reasoning
             if tool_uses:
                 out["tool_calls"] = [
                     {

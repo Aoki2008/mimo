@@ -383,7 +383,7 @@ def test_serialize_to_upstream_assistant_with_tool_use_renders_tool_calls():
     msgs = body["messages"]
     assert msgs[1]["role"] == "assistant"
     assert msgs[1]["content"] == "ok"
-    assert msgs[1]["reasoning_content"] == ""
+    assert "reasoning_content" not in msgs[1]
     assert msgs[1]["tool_calls"][0]["id"] == "t1"
     assert msgs[1]["tool_calls"][0]["function"]["name"] == "search"
     assert json.loads(msgs[1]["tool_calls"][0]["function"]["arguments"]) == {"q": "weather"}
@@ -850,7 +850,7 @@ def test_reasoning_cache_rehydrates_missing_assistant_reasoning_content():
     assert msg["reasoning_content"] == "cached reasoning"
 
 
-def test_missing_uncached_assistant_tool_call_gets_reasoning_content_field():
+def test_missing_uncached_assistant_tool_call_does_not_inject_empty_reasoning_content():
     from gateway.reasoning_cache import clear_reasoning_cache
 
     clear_reasoning_cache()
@@ -866,5 +866,4 @@ def test_missing_uncached_assistant_tool_call_gets_reasoning_content_field():
         }],
     })
     msg = _adapter().serialize_to_upstream(req)["messages"][0]
-    assert "reasoning_content" in msg
-    assert msg["reasoning_content"] == ""
+    assert "reasoning_content" not in msg
