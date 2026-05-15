@@ -465,13 +465,22 @@ async def _reclaim_old_keys(account_filename: str, current_key_data: str, logger
     matching ``current_key_data``. Without this every redeploy appends a
     new line and never deletes the predecessor — sshd's per-handshake
     linear scan slows down, and old ECSes whose pubkey is still on file
-    can keep logging in. Best-effort; failures are logged, not raised."""
+    can keep logging in. Best-effort; failures are logged, not raised.
+
+    flock around the read-filter-rewrite serializes concurrent reclaims
+    across accounts. Different accounts' awk filters never delete each
+    other's entries (the filter keys on the per-account tag), but two
+    parallel reclaim runs can both read the same snapshot, each write
+    authorized_keys.new, and the second mv overwrites the first — losing
+    the cleanup work. ``>> authorized_keys`` from _deploy_ssh_key is
+    POSIX-atomic for the <PIPE_BUF-sized line we append, so the append
+    side doesn't need the lock."""
     if not current_key_data:
         return
     comment = _ssh_key_comment(account_filename)
     quoted_comment = shlex.quote(comment)
     quoted_data = shlex.quote(current_key_data)
-    cmd = (
+    inner = (
         f"awk -v c={quoted_comment} -v d={quoted_data} "
         f"'$3 != c || $2 == d' /root/.ssh/authorized_keys "
         f"> /root/.ssh/authorized_keys.new && "
@@ -479,7 +488,11 @@ async def _reclaim_old_keys(account_filename: str, current_key_data: str, logger
         f"chmod 600 /root/.ssh/authorized_keys && "
         f"wc -l < /root/.ssh/authorized_keys"
     )
-    stdout, stderr, rc = await _ssh_jump_async(cmd)
+    cmd = (
+        f"flock -w 30 /var/lock/mimo-authorized-keys.lock "
+        f"bash -c {shlex.quote(inner)}"
+    )
+    stdout, stderr, rc = await _ssh_jump_async(cmd, timeout=45)
     if rc == 0:
         logger.log(f"已回收 {account_filename} 的旧 SSH key（authorized_keys 现 {stdout.strip()} 行）")
     else:
