@@ -1,29 +1,33 @@
 #!/bin/bash
 # Tunnel keepalive — verifies the reverse tunnel is BOTH alive (ssh process
-# running) AND working (jump-side port actually accepts a TCP connect).
-# The old keepalive only checked `pgrep ssh`, which missed the zombie case
-# where ssh was alive but `-R` forwarding had silently failed.
+# running) AND working (the api-proxy this side is forwarding to is up).
+#
+# Pre-2026-05 versions opened a *second* SSH connection to the jump server
+# every 5 min just to probe via /dev/tcp. With many accounts that doubled
+# the inbound connection count and contributed to the jump-side sshd
+# MaxStartups jam ("挤爆"). Local checks are enough because reverse-tunnel.sh
+# uses ServerAliveInterval=30 + ServerAliveCountMax=3 + ExitOnForwardFailure,
+# so a dead -R forward causes the local ssh process to exit within ~90s,
+# which the pgrep check below catches.
 #
 # Run from cron every 5 minutes; restarts the tunnel up to MAX_RETRIES.
 set -u
 
 LOG="/tmp/tunnel-keepalive.log"
-JUMP_HOST="149.88.90.137"
 API_PORT="__API_PORT__"
 TUNNEL_SCRIPT="/root/.openclaw/workspace/scripts/reverse-tunnel.sh"
 MAX_RETRIES=3
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
-# Probe via the jump server itself: bash's /dev/tcp opens a raw TCP socket
-# to 127.0.0.1:$API_PORT on the jump host. If our -R forward is alive and
-# the api-proxy is listening on this end, the connect succeeds.
 tunnel_works() {
-    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-        -i /root/.ssh/id_ed25519 \
-        root@"$JUMP_HOST" \
-        "timeout 3 bash -c '</dev/tcp/127.0.0.1/${API_PORT}' 2>/dev/null" \
-        2>/dev/null
+    # 1. The ssh -R process must still be running.
+    pgrep -f "ssh.*-R 127.0.0.1:${API_PORT}:" >/dev/null || return 1
+    # 2. The local api-proxy must be listening on 18800; otherwise the
+    #    forward has nothing to point at and restarting the tunnel won't
+    #    fix anything (api-proxy.service will, via systemd Restart=always).
+    ss -tln 2>/dev/null | grep -q ':18800 ' || return 1
+    return 0
 }
 
 restart_tunnel() {
@@ -37,8 +41,6 @@ restart_tunnel() {
 
 for attempt in $(seq 1 "$MAX_RETRIES"); do
     if tunnel_works; then
-        # Quiet success — only log on state change would be nicer, but cron
-        # runs every 5 min so a noisy log is acceptable.
         log "OK (attempt ${attempt})"
         exit 0
     fi

@@ -337,10 +337,21 @@ async def _ssh_jump_async(command: str, timeout: int = 30) -> tuple:
 
 
 def _clean_tunnel_ports_cmd(ports: list[int]) -> str:
+    """Kill sshd processes whose listening port exactly matches one in
+    ``ports``. Pre-2026-05 used ``grep -E '8022|8800'``, a substring
+    match — that would also match ``18022`` / ``80022`` / ``88001`` /
+    ``8800`` appearing inside a PID column, occasionally killing other
+    accounts' reverse-tunnel sshd processes when the panel cleaned up.
+
+    awk filter on ``$4`` (Local Address:Port) anchored at ``:PORT$`` matches
+    only exact ports, including IPv6 (``[::]:8022``) and bound forms
+    (``127.0.0.1:8022``)."""
     pattern = "|".join(str(p) for p in ports)
     return (
-        f"ss -tlnp | grep -E '{pattern}' | grep sshd | "
-        f"grep -oP 'pid=\\K[0-9]+' | sort -u | xargs -r kill 2>/dev/null; echo DONE"
+        f"ss -tlnp 2>/dev/null | "
+        f"awk '$4 ~ /:({pattern})$/ && /sshd/ {{ print }}' | "
+        f"grep -oP 'pid=\\K[0-9]+' | sort -u | xargs -r kill 2>/dev/null; "
+        f"echo DONE"
     )
 
 
@@ -377,27 +388,102 @@ def _parse_ssh_key(text: str) -> Optional[str]:
     return match.group(1).strip() if match else None
 
 
-async def _deploy_ssh_key(public_key: str, logger: DeployLogger) -> tuple:
-    quoted = shlex.quote(public_key.strip())
+def _ssh_key_comment(account_filename: str) -> str:
+    """Comment tag embedded as the SSH key's third field, used by
+    ``_reclaim_old_keys`` to identify which authorized_keys entries belong
+    to this account so we can prune superseded ones after redeploy."""
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', account_filename)
+    return f"mimo-claw:{safe}"
+
+
+def _check_port_conflict(account_filename: str, api_port: int, ssh_port: int) -> Optional[str]:
+    """Return a description of the conflict if another *enabled* account is
+    configured to use the same api_port or ssh_port, else None.
+
+    Two reverse tunnels racing for the same jump-side port lose with
+    ExitOnForwardFailure → keepalive immediately respawns ssh → another
+    failure → tight kill/restart loop hammering jump sshd. Catching the
+    conflict at deploy-start is much cheaper than letting it run."""
+    cfg = load_config()
+    for other_name, other_cfg in cfg.get("accounts", {}).items():
+        if other_name == account_filename:
+            continue
+        if not other_cfg.get("enabled", False):
+            continue
+        if other_cfg.get("api_port", 8800) == api_port:
+            return (
+                f"api_port {api_port} 已被账号 {other_name} 占用 "
+                f"（每账号需独立 jump-side 端口，否则反向隧道互相抢占）"
+            )
+        if other_cfg.get("ssh_port", 8022) == ssh_port:
+            return f"ssh_port {ssh_port} 已被账号 {other_name} 占用"
+    return None
+
+
+async def _deploy_ssh_key(public_key: str, account_filename: str, logger: DeployLogger) -> tuple:
+    """Deploy ECS pubkey to jump's authorized_keys, replacing the original
+    comment with ``mimo-claw:<account>`` so ``_reclaim_old_keys`` can later
+    prune obsolete entries for the same account.
+
+    Existence check matches on ``$2`` (key data) only — ssh authentication
+    keys on the (type, data) tuple, not the comment, so a re-deploy whose
+    pubkey happens to match a previous one shouldn't append a duplicate
+    line. Returns ``(ok, message, key_data_or_empty)``; key_data is the
+    second field used by ``_reclaim_old_keys`` to identify what to keep."""
+    parts = public_key.strip().split(None, 2)
+    if len(parts) < 2:
+        return False, f"Invalid pubkey: {public_key[:60]}", ""
+    key_type, key_data = parts[0], parts[1]
+    comment = _ssh_key_comment(account_filename)
+    tagged_key = f"{key_type} {key_data} {comment}"
+    quoted_tagged = shlex.quote(tagged_key)
+    quoted_data = shlex.quote(key_data)
+
     check_cmd = (
-        f'grep -qF {quoted} /root/.ssh/authorized_keys 2>/dev/null '
-        f'&& echo "EXISTS" || echo "NEW"'
+        f"awk -v d={quoted_data} '$2 == d {{ found=1 }} END {{ exit !found }}' "
+        f"/root/.ssh/authorized_keys 2>/dev/null && echo EXISTS || echo NEW"
     )
     stdout, stderr, rc = await _ssh_jump_async(check_cmd)
     if "EXISTS" in stdout:
         logger.log("SSH key already exists on jump server")
-        return True, "Key already deployed"
+        return True, "Key already deployed", key_data
 
     add_cmd = (
-        f'echo {quoted} >> /root/.ssh/authorized_keys && '
-        f'chmod 600 /root/.ssh/authorized_keys && echo "OK"'
+        f"echo {quoted_tagged} >> /root/.ssh/authorized_keys && "
+        f"chmod 600 /root/.ssh/authorized_keys && echo OK"
     )
     stdout, stderr, rc = await _ssh_jump_async(add_cmd)
     if rc != 0 or "OK" not in stdout:
         logger.log(f"Failed to deploy SSH key: {stderr}")
-        return False, f"Failed: {stderr}"
-    logger.log("SSH key deployed to jump server")
-    return True, "Key deployed"
+        return False, f"Failed: {stderr}", ""
+    logger.log(f"SSH key deployed to jump server (tag={comment})")
+    return True, "Key deployed", key_data
+
+
+async def _reclaim_old_keys(account_filename: str, current_key_data: str, logger: DeployLogger) -> None:
+    """Prune authorized_keys lines tagged for this account except the one
+    matching ``current_key_data``. Without this every redeploy appends a
+    new line and never deletes the predecessor — sshd's per-handshake
+    linear scan slows down, and old ECSes whose pubkey is still on file
+    can keep logging in. Best-effort; failures are logged, not raised."""
+    if not current_key_data:
+        return
+    comment = _ssh_key_comment(account_filename)
+    quoted_comment = shlex.quote(comment)
+    quoted_data = shlex.quote(current_key_data)
+    cmd = (
+        f"awk -v c={quoted_comment} -v d={quoted_data} "
+        f"'$3 != c || $2 == d' /root/.ssh/authorized_keys "
+        f"> /root/.ssh/authorized_keys.new && "
+        f"mv /root/.ssh/authorized_keys.new /root/.ssh/authorized_keys && "
+        f"chmod 600 /root/.ssh/authorized_keys && "
+        f"wc -l < /root/.ssh/authorized_keys"
+    )
+    stdout, stderr, rc = await _ssh_jump_async(cmd)
+    if rc == 0:
+        logger.log(f"已回收 {account_filename} 的旧 SSH key（authorized_keys 现 {stdout.strip()} 行）")
+    else:
+        logger.log(f"⚠️ 回收旧 SSH key 失败 (rc={rc}): {stderr.strip()[:200]}")
 
 
 # ─── Step 7: panel SSH into ECS via reverse tunnel and finalize ───
@@ -528,6 +614,16 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
     try:
         log.log("=== 开始部署 ===")
         log.log(f"账号: {account_filename} · SSH 端口: {ssh_port} · API 端口: {api_port}")
+
+        # Pre-flight: refuse to deploy if another enabled account would race
+        # for the same jump-side port. The losing tunnel falls into a tight
+        # restart loop that has historically jammed jump sshd.
+        conflict = _check_port_conflict(account_filename, api_port, ssh_port)
+        if conflict:
+            log.log(f"❌ 端口冲突，停止部署: {conflict}")
+            mark_finished("error", history_status="error")
+            return
+
         _notify_gateway_deploy_start(account_filename, api_port, log)
         gateway_prepared = True
 
@@ -672,7 +768,9 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         # Step 5: Add key on jump server.
         set_state("step5_deploy_key")
         log.log("Step 5: 在跳板机上添加 SSH 公钥...")
-        key_ok, key_msg = await _deploy_ssh_key(public_key, log)
+        key_ok, key_msg, current_key_data = await _deploy_ssh_key(
+            public_key, account_filename, log,
+        )
         if not key_ok:
             log.log(f"❌ 部署公钥失败: {key_msg}")
             mark_finished("error", history_status="error")
@@ -752,6 +850,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             log.log(f"  等待端点... ({(i + 1) * _PROBE_API_INTERVAL_S}s, {reason})")
 
         if endpoint_ok:
+            await _reclaim_old_keys(account_filename, current_key_data, log)
             _notify_gateway_deploy_done(account_filename, api_port, log)
             log.log("=== ✅ 部署完成 ===")
             mark_finished("done", history_status="done")

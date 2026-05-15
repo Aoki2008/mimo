@@ -53,24 +53,24 @@ EOF
 chmod +x "$SCRIPTS_DIR/reverse-tunnel.sh"
 
 # ── Write tunnel-keepalive.sh ──
+# Local checks only — no SSH back to jump for probing. Pre-2026-05 versions
+# opened a second SSH connection every 5 min, doubling inbound count and
+# helping push the jump-side sshd past MaxStartups. The local ssh -R
+# process exits on its own within ~90s if the forward dies (ServerAlive +
+# ExitOnForwardFailure in reverse-tunnel.sh), so pgrep is sufficient.
 echo "[3/6] write tunnel-keepalive.sh..."
 cat > "$SCRIPTS_DIR/tunnel-keepalive.sh" << KEEPALIVE
 #!/bin/bash
-# Verifies the reverse tunnel is BOTH alive (process) AND working (jump-side
-# port reachable). Restarts up to MAX_RETRIES times.
 set -u
 LOG="/tmp/tunnel-keepalive.log"
-JUMP_HOST="$JUMP_HOST"
 API_PORT="$API_PORT"
 TUNNEL_SCRIPT="$SCRIPTS_DIR/reverse-tunnel.sh"
 MAX_RETRIES=3
 log() { echo "[\$(date '+%F %T')] \$*" >> "\$LOG"; }
 tunnel_works() {
-    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \\
-        -i /root/.ssh/id_ed25519 \\
-        root@"\$JUMP_HOST" \\
-        "timeout 3 bash -c '</dev/tcp/127.0.0.1/\${API_PORT}' 2>/dev/null" \\
-        2>/dev/null
+    pgrep -f "ssh.*-R 127.0.0.1:\${API_PORT}:" >/dev/null || return 1
+    ss -tln 2>/dev/null | grep -q ':18800 ' || return 1
+    return 0
 }
 restart_tunnel() {
     log "killing stale ssh -R processes"
@@ -119,8 +119,14 @@ nohup "$SCRIPTS_DIR/reverse-tunnel.sh" > /tmp/tunnel.log 2>&1 &
 sleep 3
 
 # ── Crontab ──
+# Per-ECS random sleep (0-270s) before running keepalive so N accounts'
+# ECSes don't all hit the jump server at the same `*/5` minute boundary.
+# RANDOM is shell-built-in (0-32767); modulo 270 gives <5 min jitter.
 echo "[6/6] register tunnel-keepalive cron..."
-(crontab -l 2>/dev/null | grep -v tunnel-keepalive; echo "*/5 * * * * $SCRIPTS_DIR/tunnel-keepalive.sh") | crontab -
+KEEPALIVE_OFFSET=$((RANDOM % 270))
+echo "  cron offset: ${KEEPALIVE_OFFSET}s"
+(crontab -l 2>/dev/null | grep -v tunnel-keepalive; \
+ echo "*/5 * * * * sleep ${KEEPALIVE_OFFSET} && $SCRIPTS_DIR/tunnel-keepalive.sh") | crontab -
 
 # ── Final state ──
 echo ""
