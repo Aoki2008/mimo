@@ -69,7 +69,7 @@ MAX_RETRIES=3
 log() { echo "[\$(date '+%F %T')] \$*" >> "\$LOG"; }
 tunnel_works() {
     pgrep -f "ssh.*-R 127.0.0.1:\${API_PORT}:" >/dev/null || return 1
-    ss -tln 2>/dev/null | grep -q ':18800 ' || return 1
+    ss -tln 2>/dev/null | grep -q ":${API_PORT} " || return 1
     return 0
 }
 restart_tunnel() {
@@ -133,7 +133,7 @@ echo "  cron offset: ${KEEPALIVE_OFFSET}s"
 echo ""
 echo "=== final state ==="
 echo "service: $(systemctl is-active api-proxy)"
-echo "18800 listen: $(ss -tlnp 2>/dev/null | grep -c ':18800 ')"
+echo "${API_PORT} listen: $(ss -tlnp 2>/dev/null | grep -c ":${API_PORT} ")"
 echo "tunnel ssh procs: $(pgrep -fc "ssh.*-R 127.0.0.1:$API_PORT:" || echo 0)"
 echo "journal tail:"
 journalctl -u api-proxy -n 5 --no-pager 2>&1 | tail -5
