@@ -337,10 +337,21 @@ async def _ssh_jump_async(command: str, timeout: int = 30) -> tuple:
 
 
 def _clean_tunnel_ports_cmd(ports: list[int]) -> str:
+    """Kill sshd processes whose listening port exactly matches one in
+    ``ports``. Pre-2026-05 used ``grep -E '8022|8800'``, a substring
+    match — that would also match ``18022`` / ``80022`` / ``88001`` /
+    ``8800`` appearing inside a PID column, occasionally killing other
+    accounts' reverse-tunnel sshd processes when the panel cleaned up.
+
+    awk filter on ``$4`` (Local Address:Port) anchored at ``:PORT$`` matches
+    only exact ports, including IPv6 (``[::]:8022``) and bound forms
+    (``127.0.0.1:8022``)."""
     pattern = "|".join(str(p) for p in ports)
     return (
-        f"ss -tlnp | grep -E '{pattern}' | grep sshd | "
-        f"grep -oP 'pid=\\K[0-9]+' | sort -u | xargs -r kill 2>/dev/null; echo DONE"
+        f"ss -tlnp 2>/dev/null | "
+        f"awk '$4 ~ /:({pattern})$/ && /sshd/ {{ print }}' | "
+        f"grep -oP 'pid=\\K[0-9]+' | sort -u | xargs -r kill 2>/dev/null; "
+        f"echo DONE"
     )
 
 
@@ -375,6 +386,30 @@ _SSH_KEY_RE = re.compile(r'(ssh-(?:rsa|ed25519|ecdsa)\s+[A-Za-z0-9+/=]+(?:\s+[\w
 def _parse_ssh_key(text: str) -> Optional[str]:
     match = _SSH_KEY_RE.search(text or "")
     return match.group(1).strip() if match else None
+
+
+def _check_port_conflict(account_filename: str, api_port: int, ssh_port: int) -> Optional[str]:
+    """Return a description of the conflict if another *enabled* account is
+    configured to use the same api_port or ssh_port, else None.
+
+    Two reverse tunnels racing for the same jump-side port lose with
+    ExitOnForwardFailure → keepalive immediately respawns ssh → another
+    failure → tight kill/restart loop hammering jump sshd. Catching the
+    conflict at deploy-start is much cheaper than letting it run."""
+    cfg = load_config()
+    for other_name, other_cfg in cfg.get("accounts", {}).items():
+        if other_name == account_filename:
+            continue
+        if not other_cfg.get("enabled", False):
+            continue
+        if other_cfg.get("api_port", 8800) == api_port:
+            return (
+                f"api_port {api_port} 已被账号 {other_name} 占用 "
+                f"（每账号需独立 jump-side 端口，否则反向隧道互相抢占）"
+            )
+        if other_cfg.get("ssh_port", 8022) == ssh_port:
+            return f"ssh_port {ssh_port} 已被账号 {other_name} 占用"
+    return None
 
 
 async def _deploy_ssh_key(public_key: str, logger: DeployLogger) -> tuple:
@@ -528,6 +563,16 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
     try:
         log.log("=== 开始部署 ===")
         log.log(f"账号: {account_filename} · SSH 端口: {ssh_port} · API 端口: {api_port}")
+
+        # Pre-flight: refuse to deploy if another enabled account would race
+        # for the same jump-side port. The losing tunnel falls into a tight
+        # restart loop that has historically jammed jump sshd.
+        conflict = _check_port_conflict(account_filename, api_port, ssh_port)
+        if conflict:
+            log.log(f"❌ 端口冲突，停止部署: {conflict}")
+            mark_finished("error", history_status="error")
+            return
+
         _notify_gateway_deploy_start(account_filename, api_port, log)
         gateway_prepared = True
 
