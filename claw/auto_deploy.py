@@ -422,17 +422,17 @@ def _check_port_conflict(account_filename: str, api_port: int, ssh_port: int) ->
 
 async def _deploy_ssh_key(public_key: str, account_filename: str, logger: DeployLogger) -> tuple:
     """Deploy ECS pubkey to jump's authorized_keys, replacing the original
-    comment with ``mimo-claw:<account>`` so ``_reclaim_old_keys`` can later
-    prune obsolete entries for the same account.
+    comment with ``mimo-claw:<account>`` so the operator can later
+    ``grep mimo-claw:<account> authorized_keys`` to find which entries
+    belong to which account when pruning manually.
 
     Existence check matches on ``$2`` (key data) only — ssh authentication
     keys on the (type, data) tuple, not the comment, so a re-deploy whose
     pubkey happens to match a previous one shouldn't append a duplicate
-    line. Returns ``(ok, message, key_data_or_empty)``; key_data is the
-    second field used by ``_reclaim_old_keys`` to identify what to keep."""
+    line."""
     parts = public_key.strip().split(None, 2)
     if len(parts) < 2:
-        return False, f"Invalid pubkey: {public_key[:60]}", ""
+        return False, f"Invalid pubkey: {public_key[:60]}"
     key_type, key_data = parts[0], parts[1]
     comment = _ssh_key_comment(account_filename)
     tagged_key = f"{key_type} {key_data} {comment}"
@@ -446,7 +446,7 @@ async def _deploy_ssh_key(public_key: str, account_filename: str, logger: Deploy
     stdout, stderr, rc = await _ssh_jump_async(check_cmd)
     if "EXISTS" in stdout:
         logger.log("SSH key already exists on jump server")
-        return True, "Key already deployed", key_data
+        return True, "Key already deployed"
 
     add_cmd = (
         f"echo {quoted_tagged} >> /root/.ssh/authorized_keys && "
@@ -455,48 +455,9 @@ async def _deploy_ssh_key(public_key: str, account_filename: str, logger: Deploy
     stdout, stderr, rc = await _ssh_jump_async(add_cmd)
     if rc != 0 or "OK" not in stdout:
         logger.log(f"Failed to deploy SSH key: {stderr}")
-        return False, f"Failed: {stderr}", ""
+        return False, f"Failed: {stderr}"
     logger.log(f"SSH key deployed to jump server (tag={comment})")
-    return True, "Key deployed", key_data
-
-
-async def _reclaim_old_keys(account_filename: str, current_key_data: str, logger: DeployLogger) -> None:
-    """Prune authorized_keys lines tagged for this account except the one
-    matching ``current_key_data``. Without this every redeploy appends a
-    new line and never deletes the predecessor — sshd's per-handshake
-    linear scan slows down, and old ECSes whose pubkey is still on file
-    can keep logging in. Best-effort; failures are logged, not raised.
-
-    flock around the read-filter-rewrite serializes concurrent reclaims
-    across accounts. Different accounts' awk filters never delete each
-    other's entries (the filter keys on the per-account tag), but two
-    parallel reclaim runs can both read the same snapshot, each write
-    authorized_keys.new, and the second mv overwrites the first — losing
-    the cleanup work. ``>> authorized_keys`` from _deploy_ssh_key is
-    POSIX-atomic for the <PIPE_BUF-sized line we append, so the append
-    side doesn't need the lock."""
-    if not current_key_data:
-        return
-    comment = _ssh_key_comment(account_filename)
-    quoted_comment = shlex.quote(comment)
-    quoted_data = shlex.quote(current_key_data)
-    inner = (
-        f"awk -v c={quoted_comment} -v d={quoted_data} "
-        f"'$3 != c || $2 == d' /root/.ssh/authorized_keys "
-        f"> /root/.ssh/authorized_keys.new && "
-        f"mv /root/.ssh/authorized_keys.new /root/.ssh/authorized_keys && "
-        f"chmod 600 /root/.ssh/authorized_keys && "
-        f"wc -l < /root/.ssh/authorized_keys"
-    )
-    cmd = (
-        f"flock -w 30 /var/lock/mimo-authorized-keys.lock "
-        f"bash -c {shlex.quote(inner)}"
-    )
-    stdout, stderr, rc = await _ssh_jump_async(cmd, timeout=45)
-    if rc == 0:
-        logger.log(f"已回收 {account_filename} 的旧 SSH key（authorized_keys 现 {stdout.strip()} 行）")
-    else:
-        logger.log(f"⚠️ 回收旧 SSH key 失败 (rc={rc}): {stderr.strip()[:200]}")
+    return True, "Key deployed"
 
 
 # ─── Step 7: panel SSH into ECS via reverse tunnel and finalize ───
@@ -781,9 +742,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         # Step 5: Add key on jump server.
         set_state("step5_deploy_key")
         log.log("Step 5: 在跳板机上添加 SSH 公钥...")
-        key_ok, key_msg, current_key_data = await _deploy_ssh_key(
-            public_key, account_filename, log,
-        )
+        key_ok, key_msg = await _deploy_ssh_key(public_key, account_filename, log)
         if not key_ok:
             log.log(f"❌ 部署公钥失败: {key_msg}")
             mark_finished("error", history_status="error")
@@ -863,7 +822,6 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             log.log(f"  等待端点... ({(i + 1) * _PROBE_API_INTERVAL_S}s, {reason})")
 
         if endpoint_ok:
-            await _reclaim_old_keys(account_filename, current_key_data, log)
             _notify_gateway_deploy_done(account_filename, api_port, log)
             log.log("=== ✅ 部署完成 ===")
             mark_finished("done", history_status="done")
