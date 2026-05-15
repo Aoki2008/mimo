@@ -527,8 +527,6 @@ async def _probe_loop() -> None:
 
     async def _probe_one(backend: Backend, semaphore: asyncio.Semaphore) -> None:
         async with semaphore:
-            if backend.lifecycle == "disabled":
-                return
             try:
                 started = time.monotonic()
                 resp = await client.get(
@@ -542,11 +540,14 @@ async def _probe_loop() -> None:
                     backend.record_latency(latency)
                     # Recovery: a failed backend that passes liveness check
                     # goes back to standby so the rotation loop can re-warm it.
-                    if backend.lifecycle == "failed":
+                    if backend.lifecycle in ("failed", "disabled"):
+                        prev = backend.lifecycle
                         backend.mark_standby()
+                        backend.enabled = True
+                        backend.disabled_until = 0.0
                         logger.info(
-                            "Backend %s recovered from failed → standby",
-                            backend.backend_id,
+                            "Backend %s recovered from %s → standby",
+                            backend.backend_id, prev,
                         )
                 else:
                     backend.record_failure(
@@ -657,15 +658,8 @@ def _activate_backend(backend: Backend, *, reason: str) -> None:
     assert _registry is not None
     now = time.time()
     backend.mark_active(now=now)
-    shared_models = set(backend.models)
-    for other in _registry.all():
-        if other.backend_id == backend.backend_id:
-            continue
-        if other.lifecycle == "active" and shared_models.intersection(other.models):
-            other.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
-            _persist_backend_runtime_state(other)
     _persist_backend_runtime_state(backend)
-    logger.info("Activated backend %s by %s; draining peers for models=%s", backend.backend_id, reason, sorted(shared_models))
+    logger.info("Activated backend %s by %s", backend.backend_id, reason)
 
 
 def _reap_drained(*, now: float | None = None) -> None:

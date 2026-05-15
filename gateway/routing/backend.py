@@ -126,8 +126,8 @@ class Backend:
         self,
         error: str,
         *,
-        disable_after: int,
-        disabled_for_s: float,
+        disable_after: int = 0,
+        disabled_for_s: float = 0.0,
         now: float | None = None,
     ) -> None:
         n = now or time.time()
@@ -135,10 +135,6 @@ class Backend:
         self.readiness_failures += 1
         self.rotation_failures += 1
         self.record_failure(error, now=n)
-        if self.rotation_failures >= disable_after:
-            self.lifecycle = "disabled"
-            self.enabled = False
-            self.disabled_until = n + disabled_for_s
 
     # ───── health helpers ─────
 
