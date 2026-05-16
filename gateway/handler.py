@@ -36,13 +36,13 @@ from typing import Any, Protocol
 from gateway.adapters import OpenAIChatAdapter, ProtocolAdapter, UpstreamCodec
 from gateway.anthropic_passthrough import (
     patch_request_thinking,
-    scan_response_json,
+    scan_response_payload,
     tee_stream_capture_thinking,
+    validate_anthropic_request,
 )
 from gateway.core import (
     AdapterError,
     AuthError,
-    BadRequestError,
     GatewayError,
     InternalEvent,
     ModelNotFoundError,
@@ -184,9 +184,12 @@ class GatewayHandler:
         cache. After forwarding, we tee the response to harvest fresh thinking
         content back into the same cache.
         """
-        requested_model = body.get("model")
-        if not isinstance(requested_model, str) or not requested_model:
-            raise BadRequestError("Missing 'model'")
+        # Cheap structural validation — passthrough means malformed bodies
+        # otherwise leak straight to upstream and surface as 400s with no
+        # gateway-side breadcrumb.
+        validate_anthropic_request(body)
+
+        requested_model = body["model"]  # validated above
         ctx.model = requested_model
         ctx.is_stream = bool(body.get("stream", False))
 
@@ -216,6 +219,28 @@ class GatewayHandler:
             return await self._handle_anthropic_stream_with_retries(ctx, adapter, native, body)
         return await self._handle_anthropic_non_stream_with_retries(ctx, adapter, native, body)
 
+    def _headers_for_anthropic(
+        self, backend, ctx: RequestContext,
+    ) -> dict[str, str]:
+        """OpenAI-style auth + forward Anthropic-specific request headers.
+
+        Codex P1 from PR review: clients announce protocol version and beta
+        features via ``anthropic-version`` / ``anthropic-beta``, and the
+        upstream rejects requests that mismatch its expected version. The
+        ECS proxy already passes these through; we need to too.
+        """
+        headers = self._headers_for(backend)
+        # ctx.headers keys are lowercased by _ctx_from_request; forward in the
+        # canonical Anthropic-* casing upstream sees from real Anthropic SDKs.
+        for src_key, upstream_key in (
+            ("anthropic-version", "Anthropic-Version"),
+            ("anthropic-beta", "Anthropic-Beta"),
+        ):
+            v = ctx.headers.get(src_key)
+            if v:
+                headers[upstream_key] = v
+        return headers
+
     async def _handle_anthropic_non_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         model: str, upstream_body: dict[str, Any],
@@ -235,7 +260,8 @@ class GatewayHandler:
             tried.add(backend.backend_id)
             try:
                 return await self._handle_anthropic_non_stream(
-                    ctx, adapter, backend, upstream_body, self._headers_for(backend),
+                    ctx, adapter, backend, upstream_body,
+                    self._headers_for_anthropic(backend, ctx),
                 )
             except GatewayError as e:
                 last_error = e
@@ -288,10 +314,14 @@ class GatewayHandler:
             backend.record_success()
             backend.record_latency(latency_ms)
 
-            # Harvest thinking before returning bytes to client.
-            scan_response_json(raw)
+            # Parse the body once; reuse for thinking harvest + token counts.
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                payload = None
+            scan_response_payload(payload)
+            prompt_t, completion_t = _extract_anthropic_token_counts_from_payload(payload)
 
-            prompt_t, completion_t = _extract_anthropic_token_counts(raw)
             self._record_metric(
                 ctx, backend.backend_id, status, latency_ms,
                 prompt_tokens=prompt_t, completion_tokens=completion_t,
@@ -320,7 +350,8 @@ class GatewayHandler:
             tried.add(backend.backend_id)
             try:
                 return await self._handle_anthropic_stream(
-                    ctx, adapter, backend, upstream_body, self._headers_for(backend),
+                    ctx, adapter, backend, upstream_body,
+                    self._headers_for_anthropic(backend, ctx),
                 )
             except GatewayError as e:
                 last_error = e
@@ -375,7 +406,11 @@ class GatewayHandler:
                 details={"status": status},
             )
 
-        teed = tee_stream_capture_thinking(raw_iter)
+        # Shared mutable holder: the tee parser fills this as message_start /
+        # message_delta frames flow past, so the metrics record after the
+        # stream finishes can report real token counts.
+        usage_sink: dict[str, int] = {}
+        teed = tee_stream_capture_thinking(raw_iter, usage_sink)
         recorder = self._metrics
         bid = backend.backend_id
 
@@ -403,11 +438,8 @@ class GatewayHandler:
                             ctx=ctx, backend_id=bid,
                             status_code=status if completed else 0,
                             latency_ms=latency_ms,
-                            # Anthropic stream usage arrives in message_delta /
-                            # message_stop frames; harvesting it would need a
-                            # second parser. Leave at 0 for now — metrics page
-                            # still records the request.
-                            prompt_tokens=0, completion_tokens=0,
+                            prompt_tokens=usage_sink.get("input_tokens", 0),
+                            completion_tokens=usage_sink.get("output_tokens", 0),
                             error=error,
                         )
                     except Exception:
@@ -739,15 +771,16 @@ def _extract_token_counts(events) -> tuple[int, int]:
     return 0, 0
 
 
-def _extract_anthropic_token_counts(raw: bytes) -> tuple[int, int]:
-    """Pull (prompt, completion) from an Anthropic non-stream response body."""
-    try:
-        data = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+def _extract_anthropic_token_counts_from_payload(payload: Any) -> tuple[int, int]:
+    """Pull (prompt, completion) from an already-parsed Anthropic response.
+
+    Operates on the dict the caller has already decoded from the raw bytes,
+    avoiding a second ``json.loads`` after :func:`scan_response_payload`.
+    Returns ``(0, 0)`` for any malformed or missing usage block.
+    """
+    if not isinstance(payload, dict):
         return 0, 0
-    if not isinstance(data, dict):
-        return 0, 0
-    usage = data.get("usage")
+    usage = payload.get("usage")
     if not isinstance(usage, dict):
         return 0, 0
     try:

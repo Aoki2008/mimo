@@ -12,10 +12,10 @@ This module is the compatibility layer that fixes that:
   * On the way in (request body), :func:`patch_request_thinking` scans every
     ``assistant`` message and injects a cached ``thinking`` block when one
     is missing but ``tool_use`` blocks are present.
-  * On the way out (upstream response), :func:`scan_response_json` and
-    :func:`tee_stream_capture_thinking` capture the model-issued thinking
-    text keyed by the tool_use ids of the same message and feed it back into
-    the cache for future turns.
+  * On the way out (upstream response), :func:`scan_response_json` /
+    :func:`scan_response_payload` and :func:`tee_stream_capture_thinking`
+    capture the model-issued thinking text keyed by the tool_use ids of the
+    same message and feed it back into the cache for future turns.
 
 The cache is the same one OpenAI Chat uses (``gateway.reasoning_cache``)
 because the upstream tool ids are globally unique within a process. We
@@ -38,6 +38,11 @@ def patch_request_thinking(body: dict[str, Any]) -> int:
     contains ``tool_use`` blocks but no ``thinking`` block, looks up the
     cache by the message's tool_use ids; on hit, prepends a synthetic
     ``{"type": "thinking", "thinking": "..."}`` block.
+
+    Mutates ``body`` in place — callers that need to keep the original
+    untouched must ``deepcopy`` before calling. The handler runs this once
+    per request on a body it already owns exclusively, so the in-place
+    mutation is intentional and avoids an extra ~tens-of-KB copy per turn.
 
     Returns the number of messages patched (useful for metrics/tests).
     """
@@ -82,18 +87,45 @@ def patch_request_thinking(body: dict[str, Any]) -> int:
     return patched
 
 
-def scan_response_json(raw_body: bytes) -> None:
-    """Capture thinking text from a non-stream Anthropic response.
+def validate_anthropic_request(body: dict[str, Any]) -> None:
+    """Cheap structural validation for the byte-passthrough path.
 
-    Pulls ``thinking`` text and ``tool_use`` ids out of the assistant content
-    and stores them in the reasoning cache so the next turn — even if the
-    client drops the thinking block — can be rehydrated by
-    :func:`patch_request_thinking`.
+    The pure passthrough is fast but means malformed requests reach the
+    upstream and get rejected there. Catching the obvious shape errors here
+    gives clients a useful 400 instead of a vague upstream error, without
+    duplicating the full Anthropic schema.
+
+    Raises :class:`gateway.core.BadRequestError` on failure.
     """
-    try:
-        data = json.loads(raw_body)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return
+    from gateway.core import BadRequestError
+
+    if not isinstance(body, dict):
+        raise BadRequestError("Request body must be a JSON object")
+    model = body.get("model")
+    if not isinstance(model, str) or not model:
+        raise BadRequestError("Missing 'model'")
+    if not isinstance(body.get("max_tokens"), int):
+        raise BadRequestError("Missing or invalid 'max_tokens'")
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise BadRequestError("'messages' must be a non-empty array")
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            raise BadRequestError(f"messages[{i}] must be an object")
+        if m.get("role") not in ("user", "assistant"):
+            raise BadRequestError(
+                f"messages[{i}].role must be 'user' or 'assistant'"
+            )
+        if "content" not in m:
+            raise BadRequestError(f"messages[{i}] missing 'content'")
+
+
+def scan_response_payload(data: Any) -> None:
+    """Capture thinking from an already-parsed Anthropic response dict.
+
+    Useful when the caller has already done ``json.loads`` (e.g. to extract
+    token counts in the same pass) — avoids parsing the JSON twice.
+    """
     if not isinstance(data, dict):
         return
     content = data.get("content")
@@ -119,13 +151,33 @@ def scan_response_json(raw_body: bytes) -> None:
         remember_reasoning("".join(thinking_parts), tool_use_ids)
 
 
+def scan_response_json(raw_body: bytes) -> None:
+    """Capture thinking text from a non-stream Anthropic response.
+
+    Convenience wrapper that parses ``raw_body`` then delegates to
+    :func:`scan_response_payload`. Prefer the payload variant when you've
+    already parsed the body for some other reason.
+    """
+    try:
+        data = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return
+    scan_response_payload(data)
+
+
 def tee_stream_capture_thinking(
     raw_iter: AsyncIterator[bytes],
+    usage_sink: dict[str, int] | None = None,
 ) -> AsyncIterator[bytes]:
     """Wrap an upstream byte stream so the client sees raw passthrough while
-    we parse Anthropic SSE frames to harvest ``thinking_delta`` payloads and
-    ``tool_use`` ids. On ``message_stop`` (or stream end), the collected
-    thinking is committed to the reasoning cache.
+    we parse Anthropic SSE frames to harvest ``thinking_delta`` payloads,
+    ``tool_use`` ids, and final token usage. On ``message_stop`` (or stream
+    end), the collected thinking is committed to the reasoning cache.
+
+    ``usage_sink`` (if provided) is mutated in place with ``input_tokens`` /
+    ``output_tokens`` once they arrive in ``message_start`` / ``message_delta``
+    frames. Letting the caller pass a dict avoids the iterator needing to
+    return a tuple, keeping the streaming contract intact.
 
     SSE framing per Anthropic: blank-line-separated frames, each containing
     ``event: <name>\\n`` and ``data: <json>\\n``. We only inspect ``data:``
@@ -144,11 +196,11 @@ def tee_stream_capture_thinking(
             # uses `\n\n` as the separator — keep the partial tail in `buf`.
             while b"\n\n" in buf:
                 frame, _, buf = buf.partition(b"\n\n")
-                _ingest_frame(frame, thinking_by_idx, tool_ids_by_idx)
+                _ingest_frame(frame, thinking_by_idx, tool_ids_by_idx, usage_sink)
 
         # Final flush: any remaining frame in the tail.
         if buf.strip():
-            _ingest_frame(buf, thinking_by_idx, tool_ids_by_idx)
+            _ingest_frame(buf, thinking_by_idx, tool_ids_by_idx, usage_sink)
 
         ids = [tid for tid in tool_ids_by_idx.values() if tid]
         if not ids:
@@ -166,6 +218,7 @@ def _ingest_frame(
     frame: bytes,
     thinking_by_idx: dict[int, list[str]],
     tool_ids_by_idx: dict[int, str],
+    usage_sink: dict[str, int] | None,
 ) -> None:
     """Parse one Anthropic SSE frame and update the accumulators in place."""
     for line in frame.split(b"\n"):
@@ -182,10 +235,15 @@ def _ingest_frame(
         if not isinstance(evt, dict):
             continue
         etype = evt.get("type")
+
+        # Usage extraction: arrives at message_start (input_tokens) and
+        # message_delta (final output_tokens). Both events lack `index`.
+        if usage_sink is not None and etype in ("message_start", "message_delta"):
+            _harvest_usage(evt, etype, usage_sink)
+
         idx = evt.get("index")
         if not isinstance(idx, int):
-            # Some Anthropic frames (message_start, ping, message_delta,
-            # message_stop) carry no index — ignore them for harvesting.
+            # Other index-less frames (ping, message_stop) are advisory only.
             continue
         if etype == "content_block_start":
             block = evt.get("content_block") or {}
@@ -199,3 +257,28 @@ def _ingest_frame(
                 text = delta.get("thinking", "")
                 if isinstance(text, str) and text:
                     thinking_by_idx.setdefault(idx, []).append(text)
+
+
+def _harvest_usage(evt: dict[str, Any], etype: str, sink: dict[str, int]) -> None:
+    """Pull token counts out of message_start / message_delta frames into
+    ``sink``. Anthropic puts the initial usage inside ``message.usage`` on
+    ``message_start`` and the cumulative usage at the top level on
+    ``message_delta``."""
+    if etype == "message_start":
+        msg = evt.get("message") or {}
+        usage = msg.get("usage") if isinstance(msg, dict) else None
+    else:  # message_delta
+        usage = evt.get("usage")
+    if not isinstance(usage, dict):
+        return
+    try:
+        inp = int(usage.get("input_tokens") or 0)
+        out = int(usage.get("output_tokens") or 0)
+    except (TypeError, ValueError):
+        return
+    if inp:
+        sink["input_tokens"] = inp
+    if out:
+        # Later frames overwrite earlier ones — message_delta carries the
+        # final cumulative number, which is what we want for metrics.
+        sink["output_tokens"] = out

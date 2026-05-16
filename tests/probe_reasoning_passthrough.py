@@ -70,9 +70,11 @@ def _post_json(url: str, key: str, body: dict[str, Any]) -> dict[str, Any]:
             raw = resp.read()
             return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
+        # Don't reuse `body` here — it shadows the request parameter and makes
+        # the failure context confusing if a future change wants to log it.
+        err_body = e.read().decode("utf-8", errors="replace")
         print(f"  HTTP {e.code} from {url}", file=sys.stderr)
-        print(f"  body: {body[:500]}", file=sys.stderr)
+        print(f"  body: {err_body[:500]}", file=sys.stderr)
         raise
 
 

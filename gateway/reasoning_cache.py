@@ -29,6 +29,7 @@ _stats = {
     "hits": 0,
     "misses": 0,
     "expired": 0,        # cache had the key but TTL already lapsed
+    "evictions": 0,      # entries dropped by LRU because the cache was full
 }
 
 
@@ -57,6 +58,7 @@ def remember_reasoning(reasoning_content: str | None, tool_call_ids: Iterable[st
         _by_tool_ids.move_to_end(key)
         while len(_by_tool_ids) > _MAX_ENTRIES:
             _by_tool_ids.popitem(last=False)
+            _stats["evictions"] += 1
         _stats["stores"] += 1
 
 
