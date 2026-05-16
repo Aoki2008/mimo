@@ -462,6 +462,9 @@ async def _ecs_finalize(ssh_port: int, api_port: int, logger: DeployLogger) -> t
     # 1. SCP api-proxy.py to /tmp on ECS (finalize.sh will move it to its
     #    canonical path). We use SCP rather than `ssh ... 'cat > /tmp/...'`
     #    because a 23 KB file pipes cleanly through scp.
+    #    Clear stale host key first — new Claw = new ECS = new host key.
+    clear_key_cmd = f"ssh-keygen -R [127.0.0.1]:{ssh_port} 2>/dev/null; true"
+    await _ssh_jump_async(clear_key_cmd, timeout=5)
     scp_cmd = (
         f"scp -P {ssh_port} {ssh_opts} "
         f"{_API_PROXY_PY} root@127.0.0.1:/tmp/api-proxy.py"
