@@ -17,11 +17,8 @@ import pytest
 from gateway.anthropic_passthrough import (
     patch_request_thinking,
     scan_response_json,
-    scan_response_payload,
     tee_stream_capture_thinking,
-    validate_anthropic_request,
 )
-from gateway.core import BadRequestError
 from gateway.reasoning_cache import (
     clear_reasoning_cache,
     get_cache_stats,
@@ -387,85 +384,6 @@ def test_cache_stats_track_evictions_on_overflow(monkeypatch):
 def _lookup(ids):
     from gateway.reasoning_cache import lookup_reasoning
     return lookup_reasoning(ids)
-
-
-# ───────── validate_anthropic_request ─────────
-
-
-def test_validate_accepts_minimal_well_formed_body():
-    body = {
-        "model": "mimo-v2.5-pro",
-        "max_tokens": 1024,
-        "messages": [{"role": "user", "content": "hi"}],
-    }
-    # Must not raise.
-    validate_anthropic_request(body)
-
-
-def test_validate_rejects_non_object():
-    with pytest.raises(BadRequestError):
-        validate_anthropic_request("not a dict")  # type: ignore[arg-type]
-
-
-def test_validate_rejects_missing_model():
-    with pytest.raises(BadRequestError):
-        validate_anthropic_request({
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "x"}],
-        })
-
-
-def test_validate_rejects_missing_max_tokens():
-    with pytest.raises(BadRequestError):
-        validate_anthropic_request({
-            "model": "m",
-            "messages": [{"role": "user", "content": "x"}],
-        })
-
-
-def test_validate_rejects_empty_messages():
-    with pytest.raises(BadRequestError):
-        validate_anthropic_request({
-            "model": "m", "max_tokens": 1, "messages": [],
-        })
-
-
-def test_validate_rejects_invalid_role():
-    with pytest.raises(BadRequestError):
-        validate_anthropic_request({
-            "model": "m", "max_tokens": 1,
-            "messages": [{"role": "system", "content": "x"}],
-        })
-
-
-def test_validate_rejects_message_missing_content():
-    with pytest.raises(BadRequestError):
-        validate_anthropic_request({
-            "model": "m", "max_tokens": 1,
-            "messages": [{"role": "user"}],
-        })
-
-
-# ───────── scan_response_payload (single-parse variant) ─────────
-
-
-def test_scan_payload_accepts_already_parsed_dict():
-    payload = {
-        "content": [
-            {"type": "thinking", "thinking": "single parse"},
-            {"type": "tool_use", "id": "toolu_q", "name": "f", "input": {}},
-        ],
-    }
-    scan_response_payload(payload)
-    assert _lookup(["toolu_q"]) == "single parse"
-
-
-def test_scan_payload_handles_non_dict_input():
-    scan_response_payload(None)
-    scan_response_payload("not a dict")
-    scan_response_payload([1, 2, 3])
-    # No crash, no cache entry.
-    assert get_cache_stats()["size"] == 0
 
 
 # ───────── tee_stream usage capture ─────────

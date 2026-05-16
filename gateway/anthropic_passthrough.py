@@ -12,10 +12,10 @@ This module is the compatibility layer that fixes that:
   * On the way in (request body), :func:`patch_request_thinking` scans every
     ``assistant`` message and injects a cached ``thinking`` block when one
     is missing but ``tool_use`` blocks are present.
-  * On the way out (upstream response), :func:`scan_response_json` /
-    :func:`scan_response_payload` and :func:`tee_stream_capture_thinking`
-    capture the model-issued thinking text keyed by the tool_use ids of the
-    same message and feed it back into the cache for future turns.
+  * On the way out (upstream response), :func:`scan_response_json` and
+    :func:`tee_stream_capture_thinking` capture the model-issued thinking
+    text keyed by the tool_use ids of the same message and feed it back into
+    the cache for future turns.
 
 The cache is the same one OpenAI Chat uses (``gateway.reasoning_cache``)
 because the upstream tool ids are globally unique within a process. We
@@ -87,45 +87,18 @@ def patch_request_thinking(body: dict[str, Any]) -> int:
     return patched
 
 
-def validate_anthropic_request(body: dict[str, Any]) -> None:
-    """Cheap structural validation for the byte-passthrough path.
+def scan_response_json(raw_body: bytes) -> None:
+    """Capture thinking text from a non-stream Anthropic response.
 
-    The pure passthrough is fast but means malformed requests reach the
-    upstream and get rejected there. Catching the obvious shape errors here
-    gives clients a useful 400 instead of a vague upstream error, without
-    duplicating the full Anthropic schema.
-
-    Raises :class:`gateway.core.BadRequestError` on failure.
+    Pulls ``thinking`` text and ``tool_use`` ids out of the assistant content
+    and stores them in the reasoning cache so the next turn — even if the
+    client drops the thinking block — can be rehydrated by
+    :func:`patch_request_thinking`.
     """
-    from gateway.core import BadRequestError
-
-    if not isinstance(body, dict):
-        raise BadRequestError("Request body must be a JSON object")
-    model = body.get("model")
-    if not isinstance(model, str) or not model:
-        raise BadRequestError("Missing 'model'")
-    if not isinstance(body.get("max_tokens"), int):
-        raise BadRequestError("Missing or invalid 'max_tokens'")
-    messages = body.get("messages")
-    if not isinstance(messages, list) or not messages:
-        raise BadRequestError("'messages' must be a non-empty array")
-    for i, m in enumerate(messages):
-        if not isinstance(m, dict):
-            raise BadRequestError(f"messages[{i}] must be an object")
-        if m.get("role") not in ("user", "assistant"):
-            raise BadRequestError(
-                f"messages[{i}].role must be 'user' or 'assistant'"
-            )
-        if "content" not in m:
-            raise BadRequestError(f"messages[{i}] missing 'content'")
-
-
-def scan_response_payload(data: Any) -> None:
-    """Capture thinking from an already-parsed Anthropic response dict.
-
-    Useful when the caller has already done ``json.loads`` (e.g. to extract
-    token counts in the same pass) — avoids parsing the JSON twice.
-    """
+    try:
+        data = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return
     if not isinstance(data, dict):
         return
     content = data.get("content")
@@ -149,20 +122,6 @@ def scan_response_payload(data: Any) -> None:
 
     if thinking_parts and tool_use_ids:
         remember_reasoning("".join(thinking_parts), tool_use_ids)
-
-
-def scan_response_json(raw_body: bytes) -> None:
-    """Capture thinking text from a non-stream Anthropic response.
-
-    Convenience wrapper that parses ``raw_body`` then delegates to
-    :func:`scan_response_payload`. Prefer the payload variant when you've
-    already parsed the body for some other reason.
-    """
-    try:
-        data = json.loads(raw_body)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return
-    scan_response_payload(data)
 
 
 def tee_stream_capture_thinking(

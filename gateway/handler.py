@@ -36,13 +36,13 @@ from typing import Any, Protocol
 from gateway.adapters import OpenAIChatAdapter, ProtocolAdapter, UpstreamCodec
 from gateway.anthropic_passthrough import (
     patch_request_thinking,
-    scan_response_payload,
+    scan_response_json,
     tee_stream_capture_thinking,
-    validate_anthropic_request,
 )
 from gateway.core import (
     AdapterError,
     AuthError,
+    BadRequestError,
     GatewayError,
     InternalEvent,
     ModelNotFoundError,
@@ -184,12 +184,9 @@ class GatewayHandler:
         cache. After forwarding, we tee the response to harvest fresh thinking
         content back into the same cache.
         """
-        # Cheap structural validation — passthrough means malformed bodies
-        # otherwise leak straight to upstream and surface as 400s with no
-        # gateway-side breadcrumb.
-        validate_anthropic_request(body)
-
-        requested_model = body["model"]  # validated above
+        requested_model = body.get("model")
+        if not isinstance(requested_model, str) or not requested_model:
+            raise BadRequestError("Missing 'model'")
         ctx.model = requested_model
         ctx.is_stream = bool(body.get("stream", False))
 
@@ -314,13 +311,9 @@ class GatewayHandler:
             backend.record_success()
             backend.record_latency(latency_ms)
 
-            # Parse the body once; reuse for thinking harvest + token counts.
-            try:
-                payload = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
-                payload = None
-            scan_response_payload(payload)
-            prompt_t, completion_t = _extract_anthropic_token_counts_from_payload(payload)
+            # Harvest thinking before returning bytes to client.
+            scan_response_json(raw)
+            prompt_t, completion_t = _extract_anthropic_token_counts(raw)
 
             self._record_metric(
                 ctx, backend.backend_id, status, latency_ms,
@@ -771,16 +764,15 @@ def _extract_token_counts(events) -> tuple[int, int]:
     return 0, 0
 
 
-def _extract_anthropic_token_counts_from_payload(payload: Any) -> tuple[int, int]:
-    """Pull (prompt, completion) from an already-parsed Anthropic response.
-
-    Operates on the dict the caller has already decoded from the raw bytes,
-    avoiding a second ``json.loads`` after :func:`scan_response_payload`.
-    Returns ``(0, 0)`` for any malformed or missing usage block.
-    """
-    if not isinstance(payload, dict):
+def _extract_anthropic_token_counts(raw: bytes) -> tuple[int, int]:
+    """Pull (prompt, completion) from an Anthropic non-stream response body."""
+    try:
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return 0, 0
-    usage = payload.get("usage")
+    if not isinstance(data, dict):
+        return 0, 0
+    usage = data.get("usage")
     if not isinstance(usage, dict):
         return 0, 0
     try:
