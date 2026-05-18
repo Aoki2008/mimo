@@ -557,6 +557,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
 
     app_mod = _get_app_module()
     acurl = app_mod.acurl
+    curl_api_sync = app_mod.curl_api
     claw_ws_chat = app_mod.claw_ws_chat
     upload_to_claw_fds = app_mod.upload_to_claw_fds
 
@@ -628,12 +629,18 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         set_state("step1_create")
         log.log("Step 1: 创建新 Claw...")
 
+        # 用 sync 版 curl_api 走 asyncio.to_thread 避免与 FastAPI 主循环共享
+        # async httpx.AsyncClient 时出现的 "Future attached to a different loop"
+        # ——retry sleep 期间面板的自动刷新接口可能用同一个 client，导致连接
+        # 池被绑到主循环。
         retry_deadline = time.monotonic() + _CREATE_429_RETRY_BUDGET_S
         attempt = 0
         while True:
             attempt += 1
-            code, data = await acurl(
-                "POST", "/open-apis/user/mimo-claw/create", body={}, cookies=cookies,
+            code, data = await asyncio.to_thread(
+                curl_api_sync,
+                "POST", "/open-apis/user/mimo-claw/create",
+                body={}, cookies=cookies,
             )
             if isinstance(data, dict) and data.get("code") == 0:
                 if attempt > 1:
