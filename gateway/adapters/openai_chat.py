@@ -234,10 +234,23 @@ class OpenAIChatAdapter(ProtocolAdapter):
 
     # ============ Upstream serialization (IES → OpenAI Chat dict) ============
 
+    @staticmethod
+    def _is_empty_assistant(m: InternalMessage) -> bool:
+        """Return True if an assistant message carries nothing useful."""
+        if m.role != "assistant":
+            return False
+        has_text = any(c.type == "text" and c.text for c in m.content)
+        has_tool_use = any(c.type == "tool_use" for c in m.content)
+        return not has_text and not has_tool_use and m.reasoning_content is None
+
     def serialize_to_upstream(self, req: InternalRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": req.model,
-            "messages": [self._serialize_message(m) for m in req.messages],
+            "messages": [
+                self._serialize_message(m)
+                for m in req.messages
+                if not self._is_empty_assistant(m)
+            ],
             "max_tokens": req.max_tokens,
             "stream": req.stream,
         }
