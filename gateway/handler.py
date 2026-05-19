@@ -168,7 +168,10 @@ class GatewayHandler:
         # reasoning out of the cache.
         from gateway.adapters.openai_chat import _conversation_key_for_request
         conversation_key = _conversation_key_for_request(
-            req.messages, tools=req.tools, tool_choice=req.tool_choice,
+            req.messages,
+            tools=req.tools,
+            tool_choice=req.tool_choice,
+            thinking=req.metadata.get("thinking") if req.metadata else None,
         )
 
         if req.stream:

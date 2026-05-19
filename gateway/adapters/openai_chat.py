@@ -109,16 +109,22 @@ def _conversation_key_for_request(
     *,
     tools: list[InternalTool] | None = None,
     tool_choice: Any = None,
+    thinking: Any = None,
 ) -> str:
     """Conversation key for the request that produced this response.
 
     Hashes message history *plus* the tool surface (``tools`` /
-    ``tool_choice``). Two requests with identical messages but a
-    different tool catalog would produce different upstream behaviour
-    (different tool_use ids, different reasoning), so they're treated
-    as separate conversations — and an attacker can't pull another
-    conversation's reasoning by replaying just the messages without
-    also matching the exact tool set.
+    ``tool_choice``) *plus* the ``thinking`` switch. Two requests with
+    identical messages but different tool catalogs or thinking-mode
+    config produce different upstream behaviour (different tool_use
+    ids, different reasoning depth/style), so they're treated as
+    separate conversations.
+
+    ``thinking`` matters specifically for cross-conversation isolation:
+    on the OpenAI Chat path ``thinking`` lives in ``req.metadata`` (not
+    in messages), so omitting it from the scope would let two users
+    with identical messages + tools but different thinking budgets
+    share a cache slot — A's reasoning could leak into B's request.
 
     For OpenAI Chat there's no separate ``system`` field — system goes
     in ``messages[0]``, so it's already covered.
@@ -131,7 +137,7 @@ def _conversation_key_for_request(
             key=lambda d: d["n"],
         )
     extra = json.dumps(
-        {"tools": tools_canonical, "tool_choice": tool_choice},
+        {"tools": tools_canonical, "tool_choice": tool_choice, "thinking": thinking},
         sort_keys=True, ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8")
     return derive_conversation_key(msg_blob + b"|" + extra)
@@ -308,18 +314,19 @@ class OpenAIChatAdapter(ProtocolAdapter):
     def serialize_to_upstream(self, req: InternalRequest) -> dict[str, Any]:
         # Per-message prefix hash: for each assistant message at index k,
         # rehydration must look up the cache under
-        # ``_conversation_key_for_request(messages[:k], tools=..., tool_choice=...)``.
+        # ``_conversation_key_for_request(messages[:k], tools=..., tool_choice=..., thinking=...)``.
         # We compute incrementally so we don't re-canonicalize the prefix
-        # every time, but the tools/tool_choice tail is appended each turn
-        # so it stays part of the scope.
+        # every time, but the extras tail (tools/tool_choice/thinking)
+        # is appended each turn so it stays part of the scope.
         tools_canonical = None
         if req.tools:
             tools_canonical = sorted(
                 [{"n": t.name, "d": t.description, "p": t.input_schema} for t in req.tools],
                 key=lambda d: d["n"],
             )
+        thinking = req.metadata.get("thinking") if req.metadata else None
         extras_blob = b"|" + json.dumps(
-            {"tools": tools_canonical, "tool_choice": req.tool_choice},
+            {"tools": tools_canonical, "tool_choice": req.tool_choice, "thinking": thinking},
             sort_keys=True, ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")
 

@@ -388,6 +388,40 @@ def test_patch_does_not_rehydrate_across_different_tool_sets():
     assert patch_request_thinking(body_b) == 0
 
 
+def test_patch_rehydrates_across_reordered_tool_definitions():
+    """Same tool set in different list order should NOT cause a miss —
+    the catalog is conceptually a set. ``json.dumps(sort_keys=True)``
+    only sorts dict keys, so list order is preserved unless we
+    explicitly sort the tools list itself."""
+    common_messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_R", "name": "alpha", "input": {}},
+        ]},
+    ]
+    body_a = {
+        "model": "m",
+        "messages": common_messages,
+        "tools": [
+            {"name": "alpha", "description": "x", "input_schema": {}},
+            {"name": "beta", "description": "y", "input_schema": {}},
+        ],
+    }
+    _seed_for_turn(body_a, 1, "shared reasoning", ["toolu_R"])
+
+    body_b = {
+        "model": "m",
+        "messages": common_messages,
+        "tools": [
+            # Same set, swapped order.
+            {"name": "beta", "description": "y", "input_schema": {}},
+            {"name": "alpha", "description": "x", "input_schema": {}},
+        ],
+    }
+    assert patch_request_thinking(body_b) == 1
+    assert body_b["messages"][1]["content"][0]["thinking"] == "shared reasoning"
+
+
 # ───────── tee_stream_capture_thinking ─────────
 
 

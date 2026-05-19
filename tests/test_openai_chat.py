@@ -1018,6 +1018,37 @@ def test_reasoning_cache_continues_within_same_conversation():
     assert msg["reasoning_content"] == "step by step thinking"
 
 
+def test_reasoning_cache_isolates_different_thinking_configs():
+    """OpenAI Chat puts ``thinking`` in ``req.metadata`` (not in
+    messages). Two requests with identical messages + tools but
+    different thinking budgets must produce different scopes —
+    otherwise user A's reasoning could leak into user B's request when
+    they happen to share message history but use different thinking
+    configs.
+    """
+    from gateway.adapters.openai_chat import _conversation_key_for_request
+    from gateway.reasoning_cache import clear_reasoning_cache
+
+    clear_reasoning_cache()
+
+    common_messages = [
+        InternalMessage(role="user", content=[InternalContent(type="text", text="ask")]),
+    ]
+    # Conversation A: thinking budget 8000
+    key_a = _conversation_key_for_request(
+        common_messages, thinking={"type": "enabled", "budget_tokens": 8000},
+    )
+    # Conversation B: same messages, different thinking
+    key_b = _conversation_key_for_request(
+        common_messages, thinking={"type": "enabled", "budget_tokens": 200},
+    )
+    # Conversation C: same messages, no thinking
+    key_c = _conversation_key_for_request(common_messages, thinking=None)
+    assert key_a != key_b, "Same messages + different thinking budget must have different scope"
+    assert key_a != key_c, "Thinking-on vs thinking-off must have different scope"
+    assert key_b != key_c
+
+
 def test_remember_reasoning_rejects_empty_conversation_key():
     """Fail loud, not silent: caller passing an empty string for
     conversation_key is a bug, not a "use the default scope" instruction."""

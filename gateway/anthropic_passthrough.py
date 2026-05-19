@@ -132,10 +132,22 @@ def _conversation_key_from_body(body: dict[str, Any]) -> str:
             blocks = []
         canon_messages.append({"role": role, "content": blocks})
 
+    # Sort tools by name so two clients that ship the same catalog in
+    # different order produce the same scope. ``json.dumps(sort_keys=True)``
+    # only sorts dict keys, not list elements.
+    raw_tools = body.get("tools") or None
+    if isinstance(raw_tools, list):
+        tools_canonical = sorted(
+            (t for t in raw_tools if isinstance(t, dict)),
+            key=lambda t: (t.get("name") or ""),
+        )
+    else:
+        tools_canonical = raw_tools
+
     canonical = {
         "messages": canon_messages,
         "system": _canonical_anthropic_system(body.get("system")),
-        "tools": body.get("tools") or None,
+        "tools": tools_canonical,
         "tool_choice": body.get("tool_choice"),
         "metadata": body.get("metadata") or None,
     }
