@@ -1018,6 +1018,47 @@ def test_reasoning_cache_continues_within_same_conversation():
     assert msg["reasoning_content"] == "step by step thinking"
 
 
+def test_reasoning_cache_rehydrates_when_thinking_field_is_stripped_next_turn():
+    from gateway.adapters.openai_chat import _conversation_key_for_request
+    from gateway.reasoning_cache import clear_reasoning_cache
+
+    clear_reasoning_cache()
+    first_turn_messages = [
+        InternalMessage(role="user", content=[InternalContent(type="text", text="ask Q")]),
+    ]
+    capture_conv = _conversation_key_for_request(
+        first_turn_messages,
+        thinking={"type": "enabled", "budget_tokens": 8000},
+    )
+    fallback_conv = _conversation_key_for_request(first_turn_messages, thinking=None)
+    _adapter().parse_upstream_response(json.dumps({
+        "id": "chatcmpl-first", "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant", "content": None,
+                "reasoning_content": "cached after thinking was stripped",
+                "tool_calls": [{"id": "call_real", "type": "function",
+                                "function": {"name": "search", "arguments": "{}"}}],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }).encode(), conversation_key=[capture_conv, fallback_conv])
+
+    req = _adapter().parse_request({
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "ask Q"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "call_real", "type": "function",
+                             "function": {"name": "search", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_real", "content": "answer"},
+        ],
+    })
+    msg = _adapter().serialize_to_upstream(req)["messages"][1]
+    assert msg["reasoning_content"] == "cached after thinking was stripped"
+
+
 def test_reasoning_cache_isolates_different_thinking_configs():
     """OpenAI Chat puts ``thinking`` in ``req.metadata`` (not in
     messages). Two requests with identical messages + tools but

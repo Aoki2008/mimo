@@ -35,6 +35,30 @@ from gateway.reasoning_cache import (
 )
 
 
+def normalize_tool_choice(body: dict[str, Any]) -> None:
+    """Normalize common non-Anthropic tool_choice shorthands in place.
+
+    Some compatibility layers send OpenAI-style strings to the Anthropic
+    passthrough path. MiMo expects Anthropic's object form and rejects strings
+    before the request reaches the model.
+    """
+    choice = body.get("tool_choice")
+    if choice is None or isinstance(choice, dict):
+        return
+    if not isinstance(choice, str):
+        raise ValueError("'tool_choice' must be an object")
+
+    normalized = choice.strip()
+    if normalized in ("", "none"):
+        body.pop("tool_choice", None)
+    elif normalized == "auto":
+        body["tool_choice"] = {"type": "auto"}
+    elif normalized in ("any", "required"):
+        body["tool_choice"] = {"type": "any"}
+    else:
+        body["tool_choice"] = {"type": "tool", "name": normalized}
+
+
 def _canonical_anthropic_block(block: Any) -> Any:
     """Stable representation of a single Anthropic content block for hashing.
 

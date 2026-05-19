@@ -39,21 +39,26 @@ def _backend(backend_id: str, *, lifecycle: str = "active") -> Backend:
     return b
 
 
-def test_router_excludes_warming_and_draining_backends():
+def test_router_excludes_draining_and_unready_warming_backends():
     active = _backend("active")
-    warming = _backend("warming", lifecycle="warming")
+    warming_ready = _backend("warming-ready", lifecycle="warming")
+    warming_ready.readiness_successes = 1  # passed readiness
+    warming_unready = _backend("warming-unready", lifecycle="warming")
+    warming_unready.readiness_successes = 0  # no readiness success yet
     draining = _backend("draining", lifecycle="draining")
-    router = Router(BackendRegistry([warming, draining, active]))
+    router = Router(BackendRegistry([warming_unready, warming_ready, draining, active]))
 
     chosen, decision = router.choose(request_id="r1", model="mimo-v2.5-pro")
 
-    assert chosen.backend_id == "active"
-    assert decision.excluded["warming"] == "lifecycle=warming"
+    assert chosen.backend_id in ("active", "warming-ready")
     assert decision.excluded["draining"] == "lifecycle=draining"
+    assert decision.excluded["warming-unready"] == "warming, no readiness success yet"
 
 
 def test_router_raises_when_only_warming_backend_exists():
-    router = Router(BackendRegistry([_backend("warming", lifecycle="warming")]))
+    b = _backend("warming", lifecycle="warming")
+    b.readiness_successes = 0  # no readiness success yet
+    router = Router(BackendRegistry([b]))
 
     with pytest.raises(BackendUnavailableError):
         router.choose(request_id="r1", model="mimo-v2.5-pro")

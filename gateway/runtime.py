@@ -563,7 +563,7 @@ async def _probe_loop() -> None:
                             backend.backend_id,
                         )
                 else:
-                    backend.record_failure(
+                    backend.record_probe_failure(
                         f"http {resp.status_code}",
                         cooldown_s=_PROBE_COOLDOWN_S,
                         threshold=_PROBE_FAILURE_THRESHOLD,
@@ -577,7 +577,7 @@ async def _probe_loop() -> None:
                             backend.backend_id, backend.consecutive_failures,
                         )
             except Exception as e:
-                backend.record_failure(
+                backend.record_probe_failure(
                     f"{type(e).__name__}: {e}",
                     cooldown_s=_PROBE_COOLDOWN_S,
                     threshold=_PROBE_FAILURE_THRESHOLD,
@@ -658,7 +658,7 @@ async def _warm_ready_backends() -> None:
                 _activate_backend(b, reason="readiness")
         else:
             b.readiness_failures += 1
-            b.record_failure(reason, now=now, threshold=_PROBE_FAILURE_THRESHOLD)
+            b.record_probe_failure(reason, now=now, threshold=_PROBE_FAILURE_THRESHOLD)
             if b.readiness_failures >= _PROBE_FAILURE_THRESHOLD:
                 b.mark_failed_rotation(reason, now=now)
                 _persist_backend_runtime_state(b)
@@ -784,7 +784,7 @@ async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, 
         if status >= 400:
             return False, f"http {status}: {raw[:200]!r}"
         if name == "tool_call":
-            ok, reason = _raw_response_is_valid(raw)
+            ok, reason = _raw_response_has_tool_call(raw)
             if not ok:
                 return False, reason
         return True, "ok"
@@ -793,11 +793,16 @@ async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, 
 
 
 def _raw_response_is_valid(raw: bytes) -> tuple[bool, str]:
+    """Backward-compatible alias for the tool-call readiness parser."""
+    return _raw_response_has_tool_call(raw)
+
+
+def _raw_response_has_tool_call(raw: bytes) -> tuple[bool, str]:
     """Check that the tool-call readiness response is structurally valid.
 
-    We no longer require tool_calls in the response — models may choose to
-    respond with text instead of calling the tool.  A valid JSON response
-    with at least one choice is sufficient.
+    The readiness request forces a specific tool choice, so a valid response
+    must include at least one tool call. A normal text-only answer means the
+    endpoint accepted HTTP but did not prove tool-call readiness.
     """
     try:
         data = json.loads(raw.decode("utf-8"))
@@ -806,7 +811,16 @@ def _raw_response_is_valid(raw: bytes) -> tuple[bool, str]:
     choices = data.get("choices") if isinstance(data, dict) else None
     if not isinstance(choices, list) or not choices:
         return False, "response has no choices"
-    return True, "ok"
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return True, "ok"
+    return False, "no tool call in response"
 
 
 def _readiness_model(backend: Backend) -> str:
@@ -848,6 +862,10 @@ def _readiness_tool_call_body(backend: Backend) -> dict[str, Any]:
             },
         },
     }]
+    body["tool_choice"] = {
+        "type": "function",
+        "function": {"name": "gateway_readiness_ping"},
+    }
     return body
 
 
