@@ -28,7 +28,142 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from gateway.reasoning_cache import lookup_reasoning, remember_reasoning
+from gateway.reasoning_cache import (
+    derive_conversation_key,
+    lookup_reasoning,
+    remember_reasoning,
+)
+
+
+def _canonical_anthropic_block(block: Any) -> Any:
+    """Stable representation of a single Anthropic content block for hashing.
+
+    Skips ``thinking`` blocks: clients drop them on re-sent history (the
+    rehydration we do here is exactly to recover from that), so the hash
+    must be invariant to whether thinking is present. ``signature`` and
+    ``cache_control`` are also dropped — not part of conversation
+    identity. Keeps ``text``, ``id``, ``name``, ``input``, etc.
+    """
+    if isinstance(block, str):
+        return {"t": "text", "x": block}
+    if not isinstance(block, dict):
+        return None
+    btype = block.get("type")
+    if btype == "text":
+        return {"t": "text", "x": block.get("text") or ""}
+    if btype == "thinking":
+        # Intentionally omitted from the canonical form. See docstring.
+        return None
+    if btype == "tool_use":
+        return {
+            "t": "tool_use",
+            "id": block.get("id") or "",
+            "name": block.get("name") or "",
+            "input": block.get("input") or {},
+        }
+    if btype == "tool_result":
+        return {
+            "t": "tool_result",
+            "id": block.get("tool_use_id") or "",
+            "out": block.get("content"),
+        }
+    if btype == "image":
+        src = block.get("source") or {}
+        return {
+            "t": "image",
+            "media_type": src.get("media_type") if isinstance(src, dict) else "",
+            "data": src.get("data") if isinstance(src, dict) else "",
+        }
+    return {"t": btype, "raw": block}
+
+
+def _canonical_anthropic_system(system: Any) -> Any:
+    """Stable form of the ``system`` field (top-level on Anthropic).
+
+    Anthropic accepts ``system`` as either a string or a list of content
+    blocks (with ``cache_control`` flags etc.). Normalize so both forms
+    that are textually equivalent hash the same."""
+    if system is None:
+        return None
+    if isinstance(system, str):
+        return [{"t": "text", "x": system}]
+    if isinstance(system, list):
+        out: list[Any] = []
+        for blk in system:
+            if isinstance(blk, str):
+                out.append({"t": "text", "x": blk})
+            elif isinstance(blk, dict):
+                # cache_control is operator-tuning, not conversation identity.
+                out.append({
+                    "t": blk.get("type") or "text",
+                    "x": blk.get("text") or "",
+                })
+        return out
+    return None
+
+
+def _conversation_key_from_body(body: dict[str, Any]) -> str:
+    """Conversation-scope key from an Anthropic ``/v1/messages`` body.
+
+    Hashes every body field that contributes to "which conversation this
+    is": ``system``, ``messages``, ``tools``, ``tool_choice``,
+    ``metadata``. An attacker who forges a ``tool_use`` id must also
+    reproduce *all* of these to land in the same cache scope —
+    effectively requiring full conversation context to be guessed, which
+    isn't materially easier than knowing a session token.
+
+    Body fields that don't shape conversation identity are deliberately
+    excluded so the hash is stable across runs even if the client tweaks
+    them: ``max_tokens``, ``temperature``, ``top_p``, ``stop_sequences``,
+    ``stream``, ``model``.
+    """
+    msgs = body.get("messages") or []
+    canon_messages: list[dict[str, Any]] = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "user")
+        raw_content = m.get("content")
+        if isinstance(raw_content, str):
+            blocks = [{"t": "text", "x": raw_content}]
+        elif isinstance(raw_content, list):
+            blocks = [b for b in (_canonical_anthropic_block(c) for c in raw_content) if b is not None]
+        else:
+            blocks = []
+        canon_messages.append({"role": role, "content": blocks})
+
+    # Sort tools by name so two clients that ship the same catalog in
+    # different order produce the same scope. ``json.dumps(sort_keys=True)``
+    # only sorts dict keys, not list elements.
+    raw_tools = body.get("tools") or None
+    if isinstance(raw_tools, list):
+        tools_canonical = sorted(
+            (t for t in raw_tools if isinstance(t, dict)),
+            key=lambda t: (t.get("name") or ""),
+        )
+    else:
+        tools_canonical = raw_tools
+
+    canonical = {
+        "messages": canon_messages,
+        "system": _canonical_anthropic_system(body.get("system")),
+        "tools": tools_canonical,
+        "tool_choice": body.get("tool_choice"),
+        "metadata": body.get("metadata") or None,
+    }
+    blob = json.dumps(canonical, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return derive_conversation_key(blob)
+
+
+def _conversation_key_from_messages_up_to(
+    body: dict[str, Any], up_to_idx: int,
+) -> str:
+    """Conversation-scope key for ``messages[:up_to_idx]`` — used when
+    looking up a specific assistant turn's reasoning during the per-message
+    walk in :func:`patch_request_thinking`."""
+    truncated = dict(body)
+    truncated["messages"] = (body.get("messages") or [])[:up_to_idx]
+    return _conversation_key_from_body(truncated)
 
 
 def patch_request_thinking(body: dict[str, Any]) -> int:
@@ -51,7 +186,7 @@ def patch_request_thinking(body: dict[str, Any]) -> int:
         return 0
 
     patched = 0
-    for msg in messages:
+    for idx, msg in enumerate(messages):
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         content = msg.get("content")
@@ -85,7 +220,13 @@ def patch_request_thinking(body: dict[str, Any]) -> int:
         if has_thinking or not tool_use_ids:
             continue
 
-        cached = lookup_reasoning(tool_use_ids)
+        # Conversation key scopes the lookup to this conversation's history
+        # *before* this assistant turn — same prefix the response-capture
+        # path stored under on the previous turn. Even if a malicious
+        # client crafts a request with a known tool_use id from another
+        # conversation, their prefix won't match → cache miss → no leak.
+        conv_key = _conversation_key_from_messages_up_to(body, idx)
+        cached = lookup_reasoning(tool_use_ids, conversation_key=conv_key)
         if not cached:
             continue
 
@@ -98,13 +239,16 @@ def patch_request_thinking(body: dict[str, Any]) -> int:
     return patched
 
 
-def scan_response_json(raw_body: bytes) -> None:
+def scan_response_json(raw_body: bytes, *, conversation_key: str) -> None:
     """Capture thinking text from a non-stream Anthropic response.
 
     Pulls ``thinking`` text and ``tool_use`` ids out of the assistant content
     and stores them in the reasoning cache so the next turn — even if the
     client drops the thinking block — can be rehydrated by
-    :func:`patch_request_thinking`.
+    :func:`patch_request_thinking`. The ``conversation_key`` must be derived
+    from the request body that produced this response (via
+    :func:`_conversation_key_from_body`) so the entry can only be read back
+    on a subsequent turn of the *same* conversation.
     """
     try:
         data = json.loads(raw_body)
@@ -132,17 +276,23 @@ def scan_response_json(raw_body: bytes) -> None:
                 tool_use_ids.append(tid)
 
     if thinking_parts and tool_use_ids:
-        remember_reasoning("".join(thinking_parts), tool_use_ids)
+        remember_reasoning(
+            "".join(thinking_parts), tool_use_ids,
+            conversation_key=conversation_key,
+        )
 
 
 def tee_stream_capture_thinking(
     raw_iter: AsyncIterator[bytes],
     usage_sink: dict[str, int] | None = None,
+    *,
+    conversation_key: str,
 ) -> AsyncIterator[bytes]:
     """Wrap an upstream byte stream so the client sees raw passthrough while
     we parse Anthropic SSE frames to harvest ``thinking_delta`` payloads,
     ``tool_use`` ids, and final token usage. On ``message_stop`` (or stream
-    end), the collected thinking is committed to the reasoning cache.
+    end), the collected thinking is committed to the reasoning cache under
+    ``conversation_key`` (same scope contract as :func:`scan_response_json`).
 
     ``usage_sink`` (if provided) is mutated in place with ``input_tokens`` /
     ``output_tokens`` once they arrive in ``message_start`` / ``message_delta``
@@ -179,7 +329,7 @@ def tee_stream_capture_thinking(
             "".join(parts) for parts in thinking_by_idx.values()
         )
         if text:
-            remember_reasoning(text, ids)
+            remember_reasoning(text, ids, conversation_key=conversation_key)
 
     return _wrapped()
 
