@@ -219,20 +219,25 @@ def _is_safe_account_filename(filename: str) -> bool:
     """True iff ``filename`` is a safe single-segment account id.
 
     Rejects anything that:
-      * is empty / falsy
-      * contains path separators or NUL
-      * differs from its ``_account_filename`` sanitized form (catches `..`,
-        spaces, %-encoded leftovers, etc. — legitimate names already match
-        ``[A-Za-z0-9_\\-]+`` because that's all ``_account_filename`` allows
-        through)
-      * after joining + resolving falls outside ``ACCOUNTS_DIR`` (final
-        defense in case the sanitizer is ever loosened)
+      * is empty / falsy / not a string
+      * contains a path separator or NUL byte (``\\``, ``/``, ``\\x00``)
+      * is or starts with a dot (``..``, ``.``, ``.hidden`` → traversal /
+        hidden file)
+      * after joining + resolving falls outside ``ACCOUNTS_DIR`` (the final
+        line of defense — anything that survives the textual checks above
+        must still resolve inside the accounts directory)
+
+    Accepts otherwise arbitrary characters so e-mail-style account names
+    like ``user@example.com`` work. Earlier versions of this check rejected
+    those because they did not equal ``_account_filename(filename)``;
+    that broke every legacy account whose filename had been stored with
+    the original ``@`` / ``.`` characters intact.
     """
     if not filename or not isinstance(filename, str):
         return False
-    if "\x00" in filename or "/" in filename or "\\" in filename:
+    if any(c in filename for c in ("\x00", "/", "\\")):
         return False
-    if filename != _account_filename(filename):
+    if filename in ("..", ".") or filename.startswith("."):
         return False
     global _ACCOUNTS_DIR_RESOLVED
     if _ACCOUNTS_DIR_RESOLVED is None:
