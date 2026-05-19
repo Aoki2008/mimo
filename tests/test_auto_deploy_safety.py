@@ -164,7 +164,7 @@ def test_coordinator_allows_two_emergency_rotations_for_six_accounts():
     assert plan["accounts"]["acc2.json"]["skip_reason"] == "queued"
 
 
-def test_coordinator_skips_when_capacity_would_drop_below_emergency_minimum():
+def test_coordinator_skips_active_rotation_when_capacity_would_drop_below_emergency_minimum():
     cfg = _cfg(6)
     backends = [
         _backend("acc0.json", 56 * 60),
@@ -183,9 +183,36 @@ def test_coordinator_skips_when_capacity_would_drop_below_emergency_minimum():
     )
 
     assert plan["counts"]["active_selectable"] == 4
-    assert plan["selected"] == []
+    assert [item["account"] for item in plan["selected"]] == ["acc4.json", "acc5.json"]
     assert plan["accounts"]["acc0.json"]["skip_reason"] == "skipped_capacity"
     assert plan["accounts"]["acc1.json"]["skip_reason"] == "skipped_capacity"
+
+
+def test_coordinator_repairs_unselectable_accounts_without_reducing_capacity():
+    cfg = _cfg(6)
+    backends = [
+        _backend("acc0.json", 0, healthy=False, lifecycle="warming"),
+        _backend("acc1.json", 20 * 60),
+        _backend("acc2.json", 20 * 60),
+        _backend("acc3.json", 20 * 60),
+        _backend("acc4.json", 0, healthy=False, lifecycle="warming"),
+        _backend("acc5.json", 0, healthy=False, lifecycle="failed"),
+    ]
+
+    plan = auto_deploy._plan_rotation_batch(
+        cfg,
+        now=datetime(2026, 5, 19, 12, 0, 0),
+        backends=backends,
+        active_deploys={},
+    )
+
+    assert plan["counts"]["active_selectable"] == 3
+    assert plan["counts"]["repair_candidate_count"] == 3
+    assert plan["counts"]["min_active_required"] == 3
+    assert [item["account"] for item in plan["selected"]] == ["acc0.json"]
+    assert plan["selected"][0]["next_rotation_reason"] == "repair_no_selectable_backend"
+    assert plan["accounts"]["acc4.json"]["skip_reason"] == "queued"
+    assert plan["accounts"]["acc5.json"]["skip_reason"] == "queued"
 
 
 def test_coordinator_marks_enabled_account_without_backend_as_unmatched():
@@ -271,6 +298,26 @@ def test_trigger_deploy_blocks_when_coordinator_reports_capacity_risk(monkeypatc
 
     assert result["success"] is False
     assert result["reason"] == "skipped_capacity"
+
+
+def test_manual_trigger_allows_repair_for_unselectable_account(monkeypatch):
+    cfg = _cfg(6)
+    backends = [
+        _backend("acc0.json", 0, healthy=False, lifecycle="warming"),
+        _backend("acc1.json", 20 * 60),
+        _backend("acc2.json", 20 * 60),
+        _backend("acc3.json", 20 * 60),
+        _backend("acc4.json", 0, healthy=False, lifecycle="warming"),
+        _backend("acc5.json", 0, healthy=False, lifecycle="failed"),
+    ]
+    monkeypatch.setattr(auto_deploy, "load_config", lambda: cfg)
+    monkeypatch.setattr(auto_deploy, "_load_gateway_backends", lambda: backends)
+    monkeypatch.setattr(auto_deploy, "_active_deploys", {})
+
+    result = auto_deploy._rotation_safety_for_account("acc0.json")
+
+    assert result["safe"] is True
+    assert result["reason"] == "coordinator_selected"
 
 
 def test_trigger_deploy_marks_account_queued_before_starting_thread(monkeypatch):

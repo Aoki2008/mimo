@@ -465,6 +465,7 @@ def _rotation_reason(age_s: float) -> str:
 
 def _candidate_priority(item: dict) -> tuple:
     reason_rank = {
+        "repair_no_selectable_backend": 0,
         "hard_expiry_age": 0,
         "critical_age": 1,
         "target_age": 2,
@@ -518,6 +519,7 @@ def _plan_rotation_batch(
     account_status: dict[str, dict] = {}
     candidates: list[dict] = []
     emergency_candidates = 0
+    repair_candidates = 0
 
     for account, acc_cfg in enabled_accounts:
         matches = _account_backends(account, acc_cfg, backends)
@@ -556,7 +558,21 @@ def _plan_rotation_batch(
             status["skip_reason"] = "skipped_unmatched"
             continue
         if not selectable:
-            status["skip_reason"] = "no_selectable_backend"
+            models_for_repair = models
+            if models_for_repair:
+                candidate = {
+                    "account": account,
+                    "age_s": 0,
+                    "age_min": 0,
+                    "next_rotation_reason": "repair_no_selectable_backend",
+                    "models": models_for_repair,
+                    "repair": True,
+                }
+                candidates.append(candidate)
+                repair_candidates += 1
+                status["skip_reason"] = "repair_queued"
+            else:
+                status["skip_reason"] = "skipped_unmatched"
             continue
         if reason == "fresh":
             status["skip_reason"] = "active_fresh"
@@ -568,6 +584,7 @@ def _plan_rotation_batch(
             "age_min": round(age_s / 60.0, 1),
             "next_rotation_reason": reason,
             "models": selectable_models,
+            "repair": False,
         }
         candidates.append(candidate)
         if age_s >= _ROTATION_CRITICAL_AGE_S:
@@ -579,6 +596,10 @@ def _plan_rotation_batch(
         policy["emergency_min_active"] if emergency_mode else policy["normal_min_active"]
     )
     min_active_required = _rotation_capacity_floor(enabled_count, configured_min_active)
+    if repair_candidates and active_selectable < min_active_required:
+        # 修复坏账号不会减少现有 active 容量；容量已经低于目标时，先保留
+        # 当前可用容量，并按最小可运行集逐个修复不可选账号。
+        min_active_required = min(active_selectable, max(1, policy["emergency_min_active"] - 1))
     max_parallel = (
         policy["emergency_max_parallel"] if emergency_mode else policy["normal_max_parallel"]
     )
@@ -589,6 +610,7 @@ def _plan_rotation_batch(
 
     for candidate in candidates:
         status = account_status[candidate["account"]]
+        status["skip_reason"] = ""
         if remaining_slots <= 0:
             status["skip_reason"] = "queued"
             continue
@@ -598,6 +620,11 @@ def _plan_rotation_batch(
             if item["active"] and account not in excluded_accounts
         ]
         active_after = len(takeover_accounts)
+        if candidate.get("repair") and not status.get("active"):
+            active_after = len([
+                account for account, item in account_status.items()
+                if item["active"] and account not in (running_deploys | selected_accounts)
+            ])
         if active_after < min_active_required:
             status["skip_reason"] = "skipped_capacity"
             continue
@@ -629,6 +656,7 @@ def _plan_rotation_batch(
             "min_active_required": min_active_required,
             "max_parallel": max_parallel,
             "candidate_count": len(candidates),
+            "repair_candidate_count": repair_candidates,
             "selected_count": len(selected),
             "emergency_mode": emergency_mode,
         },
