@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -620,11 +621,100 @@ async def claw_status():
 
 # ──────────── Claw WebSocket chat ────────────
 
+def _extract_claw_status(data) -> str:
+    if isinstance(data, dict) and data.get("code") == 0:
+        return str((data.get("data") or {}).get("status") or "")
+    return ""
+
+
+async def _wait_for_claw_status(
+    cookies: list | None,
+    target_statuses: set[str],
+    *,
+    timeout_s: float = 90.0,
+    interval_s: float = 2.0,
+) -> dict:
+    deadline = time.monotonic() + timeout_s
+    last_code = ""
+    last_data = None
+    last_status = ""
+    while True:
+        code, data = await acurl(
+            "GET", "/open-apis/user/mimo-claw/status",
+            with_ph=False, cookies=cookies,
+        )
+        last_code = code
+        last_data = data
+        last_status = _extract_claw_status(data)
+        if last_status in target_statuses:
+            return {"success": True, "code": code, "data": data, "status": last_status}
+        if time.monotonic() >= deadline:
+            return {
+                "success": False,
+                "code": last_code,
+                "data": last_data,
+                "status": last_status,
+                "error": "timeout_waiting_status",
+            }
+        await asyncio.sleep(interval_s)
+
+
+async def _destroy_claw_and_wait(cookies: list | None) -> dict:
+    code, data = await acurl(
+        "POST", "/open-apis/user/mimo-claw/destroy",
+        body={}, cookies=cookies,
+    )
+    sent = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+    if not sent:
+        return {"success": False, "code": code, "data": data, "phase": "destroy"}
+
+    waited = await _wait_for_claw_status(
+        cookies,
+        {"", "DESTROYED"},
+        timeout_s=120.0,
+        interval_s=2.0,
+    )
+    waited["phase"] = "destroy_wait"
+    waited["destroy_response"] = data
+    return waited
+
+
+async def _create_claw_with_capacity_retry(
+    cookies: list | None,
+    *,
+    timeout_s: float = 180.0,
+    interval_s: float = 3.0,
+) -> dict:
+    deadline = time.monotonic() + timeout_s
+    attempts = 0
+    while True:
+        attempts += 1
+        code, data = await acurl(
+            "POST", "/open-apis/user/mimo-claw/create",
+            body={}, cookies=cookies,
+        )
+        success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+        if success:
+            return {"success": True, "code": code, "data": data, "attempts": attempts}
+
+        is_capacity_429 = (
+            isinstance(data, dict)
+            and data.get("code") == 429
+            and "上限" in str(data.get("msg", ""))
+        )
+        if not is_capacity_429 or time.monotonic() >= deadline:
+            return {
+                "success": False,
+                "code": code,
+                "data": data,
+                "attempts": attempts,
+                "retried_capacity": is_capacity_429,
+            }
+        await asyncio.sleep(min(interval_s, max(0.1, deadline - time.monotonic())))
+
 @app.post("/api/claw/destroy")
 async def claw_destroy():
-    code, data = await acurl("POST", "/open-apis/user/mimo-claw/destroy", body={})
-    success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
-    return {"success": success, "code": code, "data": data}
+    return await _destroy_claw_and_wait(None)
 
 @app.post("/api/claw/chat")
 async def claw_chat(request: Request):
@@ -731,17 +821,31 @@ async def claw_ws_chat(
             + message
         )
 
+    use_sync_api = threading.current_thread() is not threading.main_thread()
+
+    async def _mimo_api(method, path, body=None, with_ph=True, cookies_arg=None):
+        if use_sync_api:
+            return await asyncio.to_thread(
+                curl_api,
+                method,
+                path,
+                body,
+                with_ph,
+                cookies_arg,
+            )
+        return await acurl(method, path, body=body, with_ph=with_ph, cookies=cookies_arg)
+
     # Ensure claw available
-    await acurl("POST", "/open-apis/user/mimo-claw/create", body={}, cookies=cookies)
+    await _mimo_api("POST", "/open-apis/user/mimo-claw/create", body={}, cookies_arg=cookies)
 
     # Get ticket
-    code, data = await acurl("GET", "/open-apis/user/ws/ticket", cookies=cookies)
+    code, data = await _mimo_api("GET", "/open-apis/user/ws/ticket", cookies_arg=cookies)
     ticket = None
     if isinstance(data, dict) and data.get("code") == 0:
         ticket = data.get("data", {}).get("ticket")
 
     # Get userId
-    code2, data2 = await acurl("GET", "/open-apis/user/mi/get", with_ph=False, cookies=cookies)
+    code2, data2 = await _mimo_api("GET", "/open-apis/user/mi/get", with_ph=False, cookies_arg=cookies)
     user_id = None
     if isinstance(data2, dict) and data2.get("code") == 0:
         user_id = data2.get("data", {}).get("userId")
@@ -1009,11 +1113,9 @@ async def account_claw_create(filename: str):
     if not acc:
         return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
     cookies = acc.get("cookies", [])
-    code, data = await acurl("POST", "/open-apis/user/mimo-claw/create",
-                             body={}, cookies=cookies)
-    success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+    result = await _create_claw_with_capacity_retry(cookies)
     _invalidate_summary(filename)
-    return {"success": success, "code": code, "data": data}
+    return result
 
 @app.post("/api/account/{filename}/claw/destroy")
 async def account_claw_destroy(filename: str):
@@ -1022,11 +1124,9 @@ async def account_claw_destroy(filename: str):
     if not acc:
         return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
     cookies = acc.get("cookies", [])
-    code, data = await acurl("POST", "/open-apis/user/mimo-claw/destroy",
-                             body={}, cookies=cookies)
-    success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+    result = await _destroy_claw_and_wait(cookies)
     _invalidate_summary(filename)
-    return {"success": success, "code": code, "data": data}
+    return result
 
 @app.post("/api/account/{filename}/claw/refresh")
 async def account_claw_refresh(filename: str):
@@ -1035,13 +1135,24 @@ async def account_claw_refresh(filename: str):
     if not acc:
         return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
     cookies = acc.get("cookies", [])
-    await acurl("POST", "/open-apis/user/mimo-claw/destroy", body={}, cookies=cookies)
-    await asyncio.sleep(1.0)
-    code, data = await acurl("POST", "/open-apis/user/mimo-claw/create",
-                             body={}, cookies=cookies)
-    success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+    destroy_result = await _destroy_claw_and_wait(cookies)
+    if not destroy_result.get("success"):
+        _invalidate_summary(filename)
+        return {
+            "success": False,
+            "phase": "destroy",
+            "destroy": destroy_result,
+        }
+    create_result = await _create_claw_with_capacity_retry(cookies)
     _invalidate_summary(filename)
-    return {"success": success, "code": code, "data": data}
+    return {
+        "success": bool(create_result.get("success")),
+        "phase": "create",
+        "destroy": destroy_result,
+        "create": create_result,
+        "code": create_result.get("code"),
+        "data": create_result.get("data"),
+    }
 
 @app.get("/api/account/{filename}/summary")
 async def account_summary(filename: str):

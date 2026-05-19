@@ -57,12 +57,36 @@ _JUMP_LOCAL = os.environ.get("MIMO_JUMP_LOCAL") in ("1", "true", "yes")
 # step of the deploy doc (esp. the tunnel-establishment + keepalive
 # tail) or stopped partway.
 _DEBUG_CLAW = os.environ.get("MIMO_DEBUG_CLAW") in ("1", "true", "yes")
+_MIN_HEALTHY_BACKENDS_OVERRIDE = os.environ.get("MIMO_MIN_HEALTHY_BACKENDS")
+_REPAIR_COOLDOWN_S = float(os.environ.get("MIMO_REPAIR_COOLDOWN_S", "600") or "600")
 
 
 def _fmt_claw_reply(reply: str) -> str:
     if _DEBUG_CLAW:
         return reply
     return reply[:200] + "..." if len(reply) > 200 else reply
+
+
+def _harden_deploy_text(deploy_text: str) -> str:
+    """Force Claw to use the key it just generated for the reverse tunnel."""
+    replacements = {
+        "-o StrictHostKeyChecking=no \\\n  -o ServerAliveInterval=30": (
+            "-i /root/.ssh/id_ed25519 \\\n"
+            "  -o IdentitiesOnly=yes \\\n"
+            "  -o StrictHostKeyChecking=no \\\n"
+            "  -o ServerAliveInterval=30"
+        ),
+        "nohup ssh -o StrictHostKeyChecking=no \\\n  -o ServerAliveInterval=30": (
+            "nohup ssh -i /root/.ssh/id_ed25519 \\\n"
+            "  -o IdentitiesOnly=yes \\\n"
+            "  -o StrictHostKeyChecking=no \\\n"
+            "  -o ServerAliveInterval=30"
+        ),
+    }
+    hardened = deploy_text
+    for old, new in replacements.items():
+        hardened = hardened.replace(old, new)
+    return hardened
 
 
 def _notify_gateway_deploy_start(account_filename: str, api_port: int, log: "DeployLogger") -> dict:
@@ -414,7 +438,8 @@ def _load_gateway_backends() -> list[dict]:
 
 
 def _backend_url_port(backend: dict) -> int | None:
-    match = re.search(r":(\d+)(?:/)?$", str(backend.get("url") or "").rstrip("/"))
+    raw_url = backend.get("url") or backend.get("base_url") or ""
+    match = re.search(r":(\d+)(?:/)?$", str(raw_url).rstrip("/"))
     if not match:
         return None
     try:
@@ -454,6 +479,91 @@ def _backend_is_selectable(backend: dict) -> bool:
         and bool(backend.get("healthy"))
         and lifecycle in ("active", "warming")
     )
+
+
+def _local_backend_probe_ok(backend: dict, timeout_s: int = 5) -> bool:
+    port = _backend_url_port(backend)
+    if port is None:
+        return False
+    cmd = (
+        f"curl -sS -m {int(timeout_s)} -o /dev/null "
+        f"-w '%{{http_code}}' http://127.0.0.1:{port}/v1/models"
+    )
+    stdout, _stderr, rc = ssh_jump(cmd, timeout=timeout_s + 3)
+    code = (stdout or "").strip()
+    return rc == 0 and code.isdigit() and 200 <= int(code) < 500
+
+
+def _any_backend_endpoint_reachable(backends: list[dict]) -> bool:
+    for backend in backends:
+        if _local_backend_probe_ok(backend):
+            return True
+    return False
+
+
+def _healthy_backend_count(backends: list[dict]) -> int:
+    return sum(1 for backend in backends if _local_backend_probe_ok(backend, timeout_s=3))
+
+
+def _backend_reachable_for_account(account_filename: str, cfg: dict, backends: list[dict]) -> bool:
+    acc_cfg = (cfg.get("accounts") or {}).get(account_filename, {})
+    return any(_local_backend_probe_ok(backend, timeout_s=3) for backend in _account_backends(account_filename, acc_cfg, backends))
+
+
+def _repair_candidates(cfg: dict, plan: dict, backends: list[dict], now_ts: float | None = None) -> list[dict]:
+    now_ts = now_ts or time.time()
+    healthy_count = _healthy_backend_count(backends)
+    counts = plan.get("counts") or {}
+    policy = plan.get("policy") or {}
+    enabled_count = int(counts.get("enabled_accounts") or 0)
+    if _MIN_HEALTHY_BACKENDS_OVERRIDE:
+        target_floor = int(_MIN_HEALTHY_BACKENDS_OVERRIDE)
+    else:
+        target_floor = int(counts.get("normal_min_active") or counts.get("desired_active") or 2)
+    desired = min(max(1, target_floor), enabled_count)
+    if healthy_count >= desired:
+        return []
+    emergency_floor = min(
+        max(1, int(counts.get("emergency_min_active") or 0)),
+        enabled_count,
+    )
+    below_emergency_floor = healthy_count < emergency_floor
+
+    selected: list[dict] = []
+    running_repairs = sum(
+        1
+        for deploy in _active_deploys.values()
+        if _deploy_is_running(deploy)
+    )
+    parallel_limit = (
+        int(policy.get("emergency_max_parallel") or counts.get("max_parallel") or 1)
+        if below_emergency_floor
+        else int(counts.get("max_parallel") or 1)
+    )
+    repair_slots = max(0, parallel_limit - running_repairs)
+    if repair_slots <= 0:
+        return []
+    for account, acc_cfg in (cfg.get("accounts") or {}).items():
+        if len(selected) >= min(max(0, desired - healthy_count), repair_slots):
+            break
+        if not acc_cfg.get("enabled", False):
+            continue
+        if _deploy_is_running(_active_deploys.get(account)):
+            continue
+        last_repair = float(acc_cfg.get("last_repair_attempt") or 0)
+        if not below_emergency_floor and now_ts - last_repair < _REPAIR_COOLDOWN_S:
+            continue
+        if _backend_reachable_for_account(account, cfg, backends):
+            continue
+        status = (plan.get("accounts") or {}).get(account) or {}
+        selected.append({
+            "account": account,
+            "next_rotation_reason": "repair_unhealthy_backend",
+            "age_min": status.get("age_min", 0),
+            "healthy_backends": healthy_count,
+            "desired_healthy": desired,
+        })
+    return selected
 
 
 def _rotation_reason(age_s: float) -> str:
@@ -646,6 +756,21 @@ def _rotation_safety_for_account(account_filename: str, cfg: dict | None = None)
     status = (plan.get("accounts") or {}).get(account_filename)
     if status is None:
         return {"safe": False, "reason": "account_disabled_or_missing", "plan": plan}
+    counts = plan.get("counts") or {}
+    backends = _load_gateway_backends()
+    account_backends = _account_backends(
+        account_filename,
+        (cfg.get("accounts") or {}).get(account_filename, {}),
+        backends,
+    )
+    if status.get("backend_count") and (
+        int(counts.get("active_selectable") or 0) == 0
+        or not _any_backend_endpoint_reachable(backends)
+    ):
+        return {"safe": True, "reason": "bootstrap_no_backend", "plan": plan}
+    target_endpoint_reachable = any(_local_backend_probe_ok(backend) for backend in account_backends)
+    if status.get("backend_count") and not target_endpoint_reachable:
+        return {"safe": True, "reason": "recover_inactive_backend", "plan": plan}
     if any(item.get("account") == account_filename for item in plan.get("selected") or []):
         return {"safe": True, "reason": "coordinator_selected", "plan": plan}
     if not status.get("active"):
@@ -655,7 +780,6 @@ def _rotation_safety_for_account(account_filename: str, cfg: dict | None = None)
             "plan": plan,
         }
 
-    counts = plan.get("counts") or {}
     min_active_required = int(counts.get("min_active_required") or 0)
     running_accounts = {
         account for account, deploy in _active_deploys.items()
@@ -822,12 +946,110 @@ _ECS_FINALIZE_SH = PAYLOAD_DIR / "ecs_finalize.sh"
 _API_PROXY_PY = PAYLOAD_DIR / "api-proxy.py"
 
 
+def _backend_name(account_filename: str, api_port: int) -> str:
+    return f"{account_filename}@{api_port}"
+
+
+def _backend_models_for_account(acc_cfg: dict) -> list[str]:
+    models = acc_cfg.get("models")
+    if models is None:
+        models = acc_cfg.get("model")
+    try:
+        from gateway.backend_store import default_backend_models
+        default_models = default_backend_models()
+    except Exception:  # noqa: BLE001
+        default_models = ["mimo-v2.5-pro"]
+    if isinstance(models, list):
+        normalized = [m.strip() for m in models if isinstance(m, str) and m.strip()]
+    elif isinstance(models, str):
+        normalized = [m.strip() for m in models.split(",") if m.strip()]
+    else:
+        normalized = []
+    return normalized or default_models
+
+
+def _backend_api_key_for_account(acc_cfg: dict) -> str:
+    api_key = str(acc_cfg.get("backend_api_key") or acc_cfg.get("api_key") or "").strip()
+    if api_key:
+        return api_key
+    try:
+        from gateway.backend_store import default_backend_api_key
+        return default_backend_api_key()
+    except Exception:  # noqa: BLE001
+        return "sk-Aoki-MiMo"
+
+
+def _ensure_account_backend_registered(
+    account_filename: str,
+    acc_cfg: dict,
+    *,
+    active: bool,
+) -> dict:
+    api_port = int(acc_cfg.get("api_port", 8800))
+    lifecycle = "active" if active else "warming"
+    base_url = f"http://127.0.0.1:{api_port}"
+    try:
+        from gateway.backend_store import upsert_backend
+        from gateway.backend_store import list_backends
+        existing_lifecycle = ""
+        for backend in list_backends():
+            account = str(backend.get("account_id") or "")
+            url = str(backend.get("base_url") or "").rstrip("/")
+            if account in _account_match_keys(account_filename) or url.endswith(f":{api_port}"):
+                existing_lifecycle = str(backend.get("lifecycle") or "")
+                break
+        if not active and existing_lifecycle in ("active", "draining"):
+            lifecycle = existing_lifecycle
+        entry = upsert_backend(
+            name=str(acc_cfg.get("backend_name") or _backend_name(account_filename, api_port)),
+            base_url=base_url,
+            models=_backend_models_for_account(acc_cfg),
+            api_key=_backend_api_key_for_account(acc_cfg),
+            weight=int(acc_cfg.get("weight") or 1),
+            account_id=account_filename,
+            enabled=True,
+            lifecycle=lifecycle,
+        )
+        try:
+            from gateway.runtime import reload_backends
+            reload_backends()
+        except Exception:  # noqa: BLE001
+            logger_module.exception("Failed to reload gateway after backend upsert for %s", account_filename)
+        return {"success": True, "backend": entry}
+    except Exception as e:  # noqa: BLE001
+        logger_module.exception("Failed to upsert backend for %s", account_filename)
+        return {"success": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def reconcile_configured_backends(cfg: dict | None = None) -> dict:
+    """Ensure every enabled auto-deploy account has a gateway backend row."""
+    cfg = cfg or load_config()
+    added_or_updated: list[str] = []
+    errors: dict[str, str] = {}
+    for account, acc_cfg in (cfg.get("accounts") or {}).items():
+        if not acc_cfg.get("enabled", False):
+            continue
+        if not acc_cfg.get("api_port"):
+            continue
+        result = _ensure_account_backend_registered(account, acc_cfg, active=False)
+        if result.get("success"):
+            added_or_updated.append(account)
+        else:
+            errors[account] = str(result.get("error") or "unknown")
+    return {
+        "success": not errors,
+        "accounts": added_or_updated,
+        "errors": errors,
+    }
+
+
 async def _ecs_finalize(ssh_port: int, api_port: int, logger: DeployLogger) -> tuple[bool, str]:
     """SCP api-proxy.py into the ECS and run ecs_finalize.sh on it via the
     jump-server-side reverse tunnel. Returns (ok, message)."""
     ssh_opts = (
         f"-o StrictHostKeyChecking=no -o ConnectTimeout=15 "
         f"-o ServerAliveInterval=10 -o BatchMode=yes "
+        f"-o UserKnownHostsFile=/dev/null "
         f"-i {_BOOTSTRAP_PRIVKEY}"
     )
 
@@ -850,8 +1072,9 @@ async def _ecs_finalize(ssh_port: int, api_port: int, logger: DeployLogger) -> t
 
     # 2. SSH in and run ecs_finalize.sh from stdin with API_PORT set.
     ssh_cmd = (
+        f"tr -d '\\r' < {shlex.quote(str(_ECS_FINALIZE_SH))} | "
         f"ssh -p {ssh_port} {ssh_opts} root@127.0.0.1 "
-        f"'API_PORT={api_port} bash -s' < {_ECS_FINALIZE_SH}"
+        f"'API_PORT={api_port} bash -s'"
     )
     logger.log(f"Step 7b: ssh + bash -s < ecs_finalize.sh (API_PORT={api_port})...")
     stdout, stderr, rc = await _ssh_jump_async(ssh_cmd, timeout=120)
@@ -963,8 +1186,38 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             mark_finished("error", history_status="error")
             return
 
-        deploy_start = _notify_gateway_deploy_start(account_filename, api_port, log)
-        gateway_prepared = True
+        code, data = await acurl(
+            "GET", "/open-apis/user/mimo-claw/status",
+            with_ph=False, cookies=cookies,
+        )
+        current_claw_status = ""
+        if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
+            current_claw_status = str((data.get("data") or {}).get("status") or "")
+
+        safety = _rotation_safety_for_account(account_filename, cfg)
+        counts = (safety.get("plan") or {}).get("counts") or {}
+        plan_backends = _load_gateway_backends()
+        no_selectable_backend = int(counts.get("active_selectable") or 0) == 0
+        no_reachable_backend = not _any_backend_endpoint_reachable(plan_backends)
+        recover_inactive_backend = (
+            safety.get("safe") and safety.get("reason") == "recover_inactive_backend"
+        )
+        bootstrap_recovery = (
+            current_claw_status in ("", "DESTROYED", "AVAILABLE")
+            and (no_selectable_backend or no_reachable_backend or recover_inactive_backend)
+        )
+        if bootstrap_recovery:
+            deploy_start = {
+                "safe_to_destroy": True,
+                "matched": [],
+                "drained": [],
+                "blocked": [],
+                "bootstrap": True,
+            }
+            log.log("Gateway 当前没有可用 backend，进入自举恢复模式：跳过销毁安全门控。")
+        else:
+            deploy_start = _notify_gateway_deploy_start(account_filename, api_port, log)
+            gateway_prepared = True
         if not deploy_start.get("safe_to_destroy", False):
             log.log(
                 "本次自动部署已跳过：新 Claw 创建需要 5-10 分钟，"
@@ -976,12 +1229,8 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         # Step 0: Destroy existing claw if any.
         set_state("step0_destroy")
         log.log("Step 0: 检查并销毁旧 Claw...")
-        code, data = await acurl(
-            "GET", "/open-apis/user/mimo-claw/status",
-            with_ph=False, cookies=cookies,
-        )
         has_claw = False
-        if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
+        if not bootstrap_recovery and code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
             status = (data.get("data") or {}).get("status", "")
             if status not in ("", "DESTROYED", "DESTROYING"):
                 has_claw = True
@@ -1017,64 +1266,69 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
 
         # Step 1: Create claw.
         set_state("step1_create")
-        log.log("Step 1: 创建新 Claw...")
+        reuse_available_claw = bootstrap_recovery and current_claw_status == "AVAILABLE"
+        if reuse_available_claw:
+            log.log("Step 1: 当前 Claw 已是 AVAILABLE，复用现有实例")
+        else:
+            log.log("Step 1: 创建新 Claw...")
 
         # 用 sync 版 curl_api 走 asyncio.to_thread 避免与 FastAPI 主循环共享
         # async httpx.AsyncClient 时出现的 "Future attached to a different loop"
         # ——retry sleep 期间面板的自动刷新接口可能用同一个 client，导致连接
         # 池被绑到主循环。
-        retry_deadline = time.monotonic() + _CREATE_429_RETRY_BUDGET_S
-        attempt = 0
-        while True:
-            attempt += 1
-            code, data = await asyncio.to_thread(
-                curl_api_sync,
-                "POST", "/open-apis/user/mimo-claw/create",
-                body={}, cookies=cookies,
-            )
-            if isinstance(data, dict) and data.get("code") == 0:
-                if attempt > 1:
-                    log.log(f"Claw 创建请求已发送（第 {attempt} 次尝试成功）")
-                else:
-                    log.log("Claw 创建请求已发送")
-                break
-
-            # 429 "机器已达上限" 单独处理：池子满了，立即重试。其它错误维持原
-            # 行为（直接 mark_finished("error") 退出）。
-            is_capacity_429 = (
-                isinstance(data, dict)
-                and data.get("code") == 429
-                and "上限" in str(data.get("msg", ""))
-            )
-            if not is_capacity_429:
-                log.log(f"❌ 创建 Claw 失败: {data}")
-                mark_finished("error", history_status="error")
-                return
-
-            if cancelled():
-                mark_finished("cancelled", history_status="cancelled")
-                return
-
-            remaining = retry_deadline - time.monotonic()
-            if remaining <= 0:
-                log.log(
-                    f"❌ 创建 Claw 失败：MiMo 容量饱和重试 {attempt} 次后放弃"
-                    f"（预算 {_CREATE_429_RETRY_BUDGET_S}s 用尽）"
+        if not reuse_available_claw:
+            retry_deadline = time.monotonic() + _CREATE_429_RETRY_BUDGET_S
+            attempt = 0
+            while True:
+                attempt += 1
+                code, data = await asyncio.to_thread(
+                    curl_api_sync,
+                    "POST", "/open-apis/user/mimo-claw/create",
+                    body={}, cookies=cookies,
                 )
-                mark_finished("error", history_status="error")
-                return
+                if isinstance(data, dict) and data.get("code") == 0:
+                    if attempt > 1:
+                        log.log(f"Claw 创建请求已发送（第 {attempt} 次尝试成功）")
+                    else:
+                        log.log("Claw 创建请求已发送")
+                    break
 
-            sleep_s = random.uniform(0, _CREATE_429_JITTER_MAX_S)
-            log.log(
-                f"⏳ MiMo 容量饱和（429），{sleep_s:.1f}s 后重试"
-                f"（已尝试 {attempt} 次，剩余预算 {int(remaining)}s）"
-            )
-            await asyncio.sleep(sleep_s)
+                # 429 "机器已达上限" 单独处理：池子满了，立即重试。其它错误维持原
+                # 行为（直接 mark_finished("error") 退出）。
+                is_capacity_429 = (
+                    isinstance(data, dict)
+                    and data.get("code") == 429
+                    and "上限" in str(data.get("msg", ""))
+                )
+                if not is_capacity_429:
+                    log.log(f"❌ 创建 Claw 失败: {data}")
+                    mark_finished("error", history_status="error")
+                    return
+
+                if cancelled():
+                    mark_finished("cancelled", history_status="cancelled")
+                    return
+
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    log.log(
+                        f"❌ 创建 Claw 失败：MiMo 容量饱和重试 {attempt} 次后放弃"
+                        f"（预算 {_CREATE_429_RETRY_BUDGET_S}s 用尽）"
+                    )
+                    mark_finished("error", history_status="error")
+                    return
+
+                sleep_s = random.uniform(0, _CREATE_429_JITTER_MAX_S)
+                log.log(
+                    f"⏳ MiMo 容量饱和（429），{sleep_s:.1f}s 后重试"
+                    f"（已尝试 {attempt} 次，剩余预算 {int(remaining)}s）"
+                )
+                await asyncio.sleep(sleep_s)
 
         # Step 2: Wait until claw is AVAILABLE.
         set_state("step2_wait")
         log.log("Step 2: 等待 Claw 就绪...")
-        claw_ready = False
+        claw_ready = reuse_available_claw
         for i in range(_CREATE_POLL_MAX_ITERS):
             if cancelled():
                 mark_finished("cancelled", history_status="cancelled")
@@ -1111,7 +1365,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
 
         set_state("step3_send")
         session_key = f"agent:main:auto-{account_filename}-{uuid.uuid4().hex[:8]}"
-        framed_message = deploy_text
+        framed_message = _harden_deploy_text(deploy_text)
         log.log(
             f"Step 3: 发送部署文案到 Claw ({len(framed_message)} 字符)..."
         )
@@ -1238,6 +1492,15 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             log.log(f"  等待端点... ({(i + 1) * _PROBE_API_INTERVAL_S}s, {reason})")
 
         if endpoint_ok:
+            backend_result = _ensure_account_backend_registered(account_filename, acc_cfg, active=True)
+            if backend_result.get("success"):
+                backend = backend_result.get("backend") or {}
+                log.log(
+                    "Gateway backend 已登记/更新: "
+                    f"{backend.get('id', '?')} -> http://127.0.0.1:{api_port}"
+                )
+            else:
+                log.log(f"⚠️ Gateway backend 自动登记失败: {backend_result.get('error')}")
             _notify_gateway_deploy_done(account_filename, api_port, log)
             log.log("=== ✅ 部署完成 ===")
             mark_finished("done", history_status="done")
@@ -1320,8 +1583,11 @@ def _scheduler_loop():
         try:
             cfg = load_config()
             now = datetime.now()
-            plan = _plan_rotation_batch(cfg, now=now)
-            selected = plan.get("selected") or []
+            reconcile_configured_backends(cfg)
+            backends = _load_gateway_backends()
+            plan = _plan_rotation_batch(cfg, now=now, backends=backends)
+            repair_selected = _repair_candidates(cfg, plan, backends, now_ts=now.timestamp())
+            selected = repair_selected or (plan.get("selected") or [])
             if selected:
                 for item in selected:
                     acc_filename = item["account"]
@@ -1335,6 +1601,8 @@ def _scheduler_loop():
                         flush=True,
                     )
                     cfg["accounts"][acc_filename]["last_run"] = now.timestamp()
+                    if item.get("next_rotation_reason") == "repair_unhealthy_backend":
+                        cfg["accounts"][acc_filename]["last_repair_attempt"] = now.timestamp()
                 save_config(cfg)
                 for item in selected:
                     trigger_deploy(item["account"])

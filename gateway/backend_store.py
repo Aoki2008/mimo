@@ -22,6 +22,32 @@ DATA_PATH = Path(__file__).parent.parent / "data" / "backends.json"
 
 _lock = threading.Lock()
 
+# Mirrors the model list exposed by claw/payload/api-proxy.py so freshly
+# deployed backends can be registered without manual model input.
+DEFAULT_BACKEND_MODELS: tuple[str, ...] = (
+    "mimo-v2.5-pro",
+    "mimo-v2.5",
+    "mimo-v2-pro",
+    "mimo-v2-flash",
+    "mimo-v2-omni",
+    "mimo-v2-tts",
+    "mimo-v2.5-tts",
+    "mimo-v2.5-tts-voiceclone",
+    "mimo-v2.5-tts-voicedesign",
+)
+
+
+def default_backend_models() -> list[str]:
+    return list(DEFAULT_BACKEND_MODELS)
+
+
+def default_backend_api_key() -> str:
+    return (
+        os.environ.get("PROXY_AUTH_TOKEN")
+        or os.environ.get("MIMO_BACKEND_API_KEY")
+        or "sk-Aoki-MiMo"
+    ).strip() or "sk-Aoki-MiMo"
+
 
 def _empty() -> dict:
     return {"backends": []}
@@ -45,6 +71,50 @@ def _normalize_models(raw: Any) -> list[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+def _normalize_backend_spec(
+    *,
+    name: str,
+    base_url: str,
+    models: Any = None,
+    api_key: str = "",
+    weight: int = 1,
+    account_id: str = "",
+    model: str = "",
+    aliases: str = "",
+    default_models: Any = None,
+    default_api_key: str = "",
+) -> dict[str, Any]:
+    name = (name or "").strip()
+    base_url = (base_url or "").strip().rstrip("/")
+    model_list = _normalize_models(models) if models is not None else []
+    if not model_list:
+        if model:
+            model_list.append(model.strip())
+        for a in (aliases or "").split(","):
+            a = a.strip()
+            if a and a not in model_list:
+                model_list.append(a)
+    if not model_list and default_models is not None:
+        model_list = _normalize_models(list(default_models))
+    api_key = (api_key or "").strip()
+    if not api_key and default_api_key:
+        api_key = default_api_key.strip()
+    if not name:
+        raise ValueError("name 不能为空")
+    if not base_url:
+        raise ValueError("base_url 不能为空")
+    if not model_list:
+        raise ValueError("models 不能为空")
+    return {
+        "name": name,
+        "base_url": base_url,
+        "models": model_list,
+        "api_key": api_key,
+        "weight": max(1, int(weight)),
+        "account_id": account_id,
+    }
 
 
 def _migrate_entry(entry: dict) -> dict:
@@ -109,33 +179,19 @@ def add_backend(
     model: str = "",
     aliases: str = "",
 ) -> dict[str, Any]:
-    name = (name or "").strip()
-    base_url = (base_url or "").strip().rstrip("/")
-    model_list = _normalize_models(models) if models is not None else []
-    if not model_list:
-        # legacy path
-        if model:
-            model_list.append(model.strip())
-        for a in (aliases or "").split(","):
-            a = a.strip()
-            if a and a not in model_list:
-                model_list.append(a)
-    if not name:
-        raise ValueError("name 不能为空")
-    if not base_url:
-        raise ValueError("base_url 不能为空")
-    if not model_list:
-        raise ValueError("models 不能为空")
-
-    backend_id = secrets.token_hex(6)
+    base = _normalize_backend_spec(
+        name=name,
+        base_url=base_url,
+        models=models,
+        api_key=api_key,
+        weight=weight,
+        account_id=account_id,
+        model=model,
+        aliases=aliases,
+    )
     entry: dict[str, Any] = {
-        "id": backend_id,
-        "name": name,
-        "base_url": base_url,
-        "models": model_list,
-        "api_key": api_key,
-        "weight": max(1, int(weight)),
-        "account_id": account_id,
+        "id": secrets.token_hex(6),
+        **base,
         "enabled": True,
         "lifecycle": "warming",
     }
@@ -147,6 +203,106 @@ def add_backend(
         data["backends"].append(entry)
         _save(data)
     return entry
+
+
+def upsert_backend(
+    *,
+    name: str,
+    base_url: str,
+    models: Any = None,
+    api_key: str = "",
+    weight: int = 1,
+    account_id: str = "",
+    enabled: bool = True,
+    lifecycle: str = "active",
+    model: str = "",
+    aliases: str = "",
+) -> dict[str, Any]:
+    """Create or update a backend entry keyed by account_id/base_url/name."""
+    base = _normalize_backend_spec(
+        name=name,
+        base_url=base_url,
+        models=models,
+        api_key=api_key,
+        weight=weight,
+        account_id=account_id,
+        model=model,
+        aliases=aliases,
+        default_models=DEFAULT_BACKEND_MODELS,
+        default_api_key=default_backend_api_key(),
+    )
+
+    def _account_matches(stored: str, requested: str) -> bool:
+        stored = (stored or "").strip()
+        requested = (requested or "").strip()
+        if not stored or not requested:
+            return False
+        if stored == requested:
+            return True
+        if stored.endswith(".json") and stored[:-5] == requested:
+            return True
+        if requested.endswith(".json") and requested[:-5] == stored:
+            return True
+        return False
+
+    with _lock:
+        data = _load()
+        target: dict[str, Any] | None = None
+        for b in data["backends"]:
+            if account_id and _account_matches(str(b.get("account_id") or ""), account_id):
+                target = b
+                break
+        if target is None:
+            for b in data["backends"]:
+                if (b.get("base_url") or "").rstrip("/") == base["base_url"]:
+                    target = b
+                    break
+        if target is None:
+            for b in data["backends"]:
+                if b.get("name") == base["name"]:
+                    target = b
+                    break
+
+        if target is None:
+            entry = {
+                "id": secrets.token_hex(6),
+                **base,
+                "enabled": bool(enabled),
+                "lifecycle": lifecycle or "active",
+            }
+            data["backends"].append(entry)
+            _save(data)
+            return entry
+
+        updated = False
+        if target.get("name") != base["name"]:
+            target["name"] = base["name"]
+            updated = True
+        if (target.get("base_url") or "").rstrip("/") != base["base_url"]:
+            target["base_url"] = base["base_url"]
+            updated = True
+        if _normalize_models(target.get("models")) != base["models"]:
+            target["models"] = base["models"]
+            updated = True
+        if base["api_key"] and target.get("api_key") != base["api_key"]:
+            target["api_key"] = base["api_key"]
+            updated = True
+        if int(target.get("weight") or 0) != base["weight"]:
+            target["weight"] = base["weight"]
+            updated = True
+        if (target.get("account_id") or "") != base["account_id"]:
+            target["account_id"] = base["account_id"]
+            updated = True
+        if bool(target.get("enabled", True)) != bool(enabled):
+            target["enabled"] = bool(enabled)
+            updated = True
+        desired_lifecycle = lifecycle or target.get("lifecycle") or "active"
+        if target.get("lifecycle") != desired_lifecycle:
+            target["lifecycle"] = desired_lifecycle
+            updated = True
+        if updated:
+            _save(data)
+        return target
 
 
 def update_backend(backend_id: str, **fields: Any) -> dict[str, Any] | None:

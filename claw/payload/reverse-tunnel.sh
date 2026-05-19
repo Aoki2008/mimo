@@ -7,6 +7,8 @@
 # instead of staying alive as a "zombie" with a dead forward, which is what
 # made the simple "pgrep ssh" keepalive miss the failure mode.
 exec ssh \
+    -i /root/.ssh/id_ed25519 \
+    -o IdentitiesOnly=yes \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
     -o ConnectTimeout=10 \

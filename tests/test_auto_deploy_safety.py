@@ -203,6 +203,90 @@ def test_coordinator_marks_enabled_account_without_backend_as_unmatched():
     assert plan["accounts"]["acc2.json"]["skip_reason"] == "skipped_unmatched"
 
 
+def test_reconcile_configured_backends_upserts_enabled_accounts(monkeypatch):
+    cfg = _cfg(3)
+    calls: list[tuple[str, bool]] = []
+
+    def fake_ensure(account: str, acc_cfg: dict, *, active: bool):
+        calls.append((account, active))
+        return {"success": True, "backend": {"id": account}}
+
+    monkeypatch.setattr(auto_deploy, "_ensure_account_backend_registered", fake_ensure)
+
+    result = auto_deploy.reconcile_configured_backends(cfg)
+
+    assert result["success"] is True
+    assert [account for account, _active in calls] == ["acc0.json", "acc1.json", "acc2.json"]
+    assert {active for _account, active in calls} == {False}
+
+
+def test_repair_candidates_targets_normal_min_active_by_default(monkeypatch):
+    cfg = _cfg(6)
+    backends = [_backend(f"acc{i}.json", 10 * 60, healthy=i < 4) for i in range(6)]
+    plan = auto_deploy._plan_rotation_batch(
+        cfg,
+        now=datetime(2026, 5, 19, 12, 0, 0),
+        backends=backends,
+        active_deploys={},
+    )
+    probe_by_port = {8800 + i: i < 4 for i in range(6)}
+
+    monkeypatch.setattr(
+        auto_deploy,
+        "_local_backend_probe_ok",
+        lambda backend, timeout_s=5: probe_by_port[auto_deploy._backend_url_port(backend)],
+    )
+
+    selected = auto_deploy._repair_candidates(cfg, plan, backends, now_ts=1000)
+
+    assert plan["counts"]["normal_min_active"] == 5
+    assert len(selected) == 1
+    assert selected[0]["desired_healthy"] == 5
+    assert selected[0]["account"] == "acc4.json"
+
+
+def test_repair_candidates_respects_parallel_slots(monkeypatch):
+    cfg = _cfg(6)
+    backends = [_backend(f"acc{i}.json", 10 * 60, healthy=i < 4) for i in range(6)]
+    plan = auto_deploy._plan_rotation_batch(
+        cfg,
+        now=datetime(2026, 5, 19, 12, 0, 0),
+        backends=backends,
+        active_deploys={},
+    )
+    monkeypatch.setattr(auto_deploy, "_local_backend_probe_ok", lambda backend, timeout_s=5: backend["healthy"])
+    monkeypatch.setattr(
+        auto_deploy,
+        "_active_deploys",
+        {"acc4.json": {"state": "step1_create", "finished_ts": None}},
+    )
+
+    selected = auto_deploy._repair_candidates(cfg, plan, backends, now_ts=1000)
+
+    assert selected == []
+
+
+def test_repair_candidates_bypasses_cooldown_below_emergency_floor(monkeypatch):
+    cfg = _cfg(6)
+    for acc_cfg in cfg["accounts"].values():
+        acc_cfg["last_repair_attempt"] = 999
+    backends = [_backend(f"acc{i}.json", 10 * 60, healthy=i < 3) for i in range(6)]
+    plan = auto_deploy._plan_rotation_batch(
+        cfg,
+        now=datetime(2026, 5, 19, 12, 0, 0),
+        backends=backends,
+        active_deploys={},
+    )
+    monkeypatch.setattr(auto_deploy, "_local_backend_probe_ok", lambda backend, timeout_s=5: backend["healthy"])
+    monkeypatch.setattr(auto_deploy, "_active_deploys", {})
+
+    selected = auto_deploy._repair_candidates(cfg, plan, backends, now_ts=1000)
+
+    assert plan["counts"]["emergency_min_active"] == 4
+    assert len(selected) == 2
+    assert [item["account"] for item in selected] == ["acc3.json", "acc4.json"]
+
+
 def test_scheduler_status_exposes_coordinator_fields(monkeypatch):
     cfg = _cfg(6)
     backends = [_backend(f"acc{i}.json", 10 * 60) for i in range(6)]
@@ -242,7 +326,12 @@ def test_scheduler_loop_triggers_only_coordinator_selected_accounts(monkeypatch)
 
     monkeypatch.setattr(auto_deploy, "load_config", lambda: cfg)
     monkeypatch.setattr(auto_deploy, "save_config", lambda updated: saved_configs.append(updated.copy()))
-    monkeypatch.setattr(auto_deploy, "_plan_rotation_batch", lambda updated, now=None: plan)
+    monkeypatch.setattr(
+        auto_deploy,
+        "_plan_rotation_batch",
+        lambda updated, now=None, backends=None, active_deploys=None: plan,
+    )
+    monkeypatch.setattr(auto_deploy, "reconcile_configured_backends", lambda updated: {"success": True})
     monkeypatch.setattr(auto_deploy, "trigger_deploy", lambda account: triggered.append(account))
 
     def stop_after_first_sleep(_seconds: int) -> None:

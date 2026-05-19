@@ -42,6 +42,8 @@ cat > "$SCRIPTS_DIR/reverse-tunnel.sh" << EOF
 # jump server at 127.0.0.1:$API_PORT. ExitOnForwardFailure=yes avoids the
 # zombie state where ssh stays alive while -R forwarding is dead.
 exec ssh \\
+    -i /root/.ssh/id_ed25519 \\
+    -o IdentitiesOnly=yes \\
     -o ServerAliveInterval=30 \\
     -o ServerAliveCountMax=3 \\
     -o ConnectTimeout=10 \\

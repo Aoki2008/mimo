@@ -206,7 +206,12 @@ def reload_backends() -> int:
         existing.detection_entered_at = fresh.detection_entered_at
         if fresh.lifecycle != existing.lifecycle:
             if fresh.lifecycle == "warming":
-                existing.mark_warming(now=now)
+                if existing.is_selectable(now):
+                    # A config reconcile should not demote an already healthy
+                    # in-memory backend. Keep verified capacity in the pool.
+                    pass
+                else:
+                    existing.mark_warming(now=now)
             elif fresh.lifecycle == "active":
                 existing.mark_active(now=now)
             elif fresh.lifecycle == "draining":
@@ -468,16 +473,11 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
         backend.health = "alive"
         backend.consecutive_failures = 0
         backend.last_error = ""
-        if _has_selectable_peer(backend):
-            backend.mark_warming(now=now)
-            backend.last_probe_at = 0.0
-            warmed.append(backend.backend_id)
-        else:
-            # The deploy flow has already verified the endpoint. If no peer is
-            # carrying traffic, restore service immediately instead of waiting
-            # for the background rotation loop.
-            backend.mark_active(now=now)
-            activated.append(backend.backend_id)
+        # The deploy flow has already verified this endpoint via /v1/models.
+        # Keep it in the active pool so multiple verified Claws remain
+        # load-balancing peers instead of collapsing back to one healthy backend.
+        backend.mark_active(now=now)
+        activated.append(backend.backend_id)
         _persist_backend_runtime_state(backend)
     return {
         "success": True,

@@ -175,6 +175,30 @@ def test_persist_backend_runtime_state_logs_failures(monkeypatch, caplog):
     assert "Failed to persist backend state for candidate" in caplog.text
 
 
+def test_upsert_backend_registers_and_updates_by_account(monkeypatch):
+    entry = backend_store.upsert_backend(
+        name="alice@8800",
+        base_url="http://127.0.0.1:8800",
+        account_id="alice.json",
+        lifecycle="active",
+    )
+
+    again = backend_store.upsert_backend(
+        name="alice@8801",
+        base_url="http://127.0.0.1:8801",
+        account_id="alice",
+        lifecycle="active",
+    )
+    stored = backend_store.list_backends()
+
+    assert len(stored) == 1
+    assert again["id"] == entry["id"]
+    assert stored[0]["base_url"] == "http://127.0.0.1:8801"
+    assert stored[0]["account_id"] == "alice"
+    assert "mimo-v2.5-pro" in stored[0]["models"]
+    assert stored[0]["api_key"] == "sk-Aoki-MiMo"
+
+
 def test_concurrent_warm_and_manual_activate_keeps_all_ready_backends_active(monkeypatch):
     old = _backend("old")
     warm_a = _backend("warm-a", lifecycle="warming")
@@ -280,7 +304,7 @@ def test_promote_standby_backend_activates_when_no_capacity_exists(monkeypatch):
     assert standby.lifecycle == "active"
 
 
-def test_complete_account_deploy_reloads_and_warms_with_active_peer(monkeypatch):
+def test_complete_account_deploy_keeps_verified_backend_active_with_peer(monkeypatch):
     old = _backend("old", lifecycle="draining")
     old.account_id = "alice"
     peer = _backend("peer")
@@ -292,10 +316,9 @@ def test_complete_account_deploy_reloads_and_warms_with_active_peer(monkeypatch)
 
     result = runtime.complete_account_deploy("alice")
 
-    assert result["warmed"] == ["old"]
-    assert result["activated"] == []
-    assert old.lifecycle == "warming"
-    assert old.last_probe_at == 0.0
+    assert result["warmed"] == []
+    assert result["activated"] == ["old"]
+    assert old.lifecycle == "active"
     assert peer.lifecycle == "active"
 
 
