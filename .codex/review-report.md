@@ -28,6 +28,9 @@
 4. readiness 与路由策略更稳。
    warming backend 只有 readiness 成功后才可选择；探针失败单独计数；routing score 对已有足够样本的高失败率 backend 增加惩罚。
 
+5. Claw 轮换不再主动制造无后端窗口。
+   `claw/auto_deploy.py` 会在没有可接管健康后端时跳过销毁旧 Claw；`gateway/runtime.py` 将默认轮换年龄调至 40 分钟，并用 selectable peer 而不是单纯 active peer 判断接管能力。
+
 ## 审查清单
 
 - 需求字段完整性：通过。目标、范围、验证方式、风险均已记录。
@@ -40,7 +43,7 @@
 
 ```text
 python -m pytest tests/ -q
-247 passed, 4 warnings in 3.95s
+251 passed, 4 warnings in 4.39s
 ```
 
 ```text

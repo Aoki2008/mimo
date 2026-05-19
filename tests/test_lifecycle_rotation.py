@@ -239,6 +239,23 @@ def test_prepare_account_deploy_blocks_when_no_peer_exists(monkeypatch):
     assert only.lifecycle == "active"
 
 
+def test_prepare_account_deploy_blocks_when_peer_is_not_selectable(monkeypatch):
+    old = _backend("old")
+    old.account_id = "alice"
+    peer = _backend("peer")
+    peer.account_id = "bob"
+    peer.in_detection = True
+    reg = BackendRegistry([old, peer])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    result = runtime.prepare_account_deploy("alice")
+
+    assert result["drained"] == []
+    assert result["blocked"] == ["old"]
+    assert old.lifecycle == "active"
+
+
 def test_promote_standby_backends_to_warming_fills_load_balancing_pool(monkeypatch):
     active = _backend("active")
     standby = _backend("standby", lifecycle="standby")
@@ -295,3 +312,7 @@ def test_complete_account_deploy_activates_when_no_peer_exists(monkeypatch):
     assert result["warmed"] == []
     assert result["activated"] == ["only"]
     assert only.lifecycle == "active"
+
+
+def test_rotation_interval_defaults_to_40_minutes():
+    assert runtime._ROTATION_INTERVAL_S == 40 * 60.0

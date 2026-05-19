@@ -21,7 +21,7 @@ python -m pytest tests/ -q
 结果：
 
 ```text
-247 passed, 4 warnings in 3.95s
+251 passed, 4 warnings in 4.39s
 ```
 
 警告均为 FastAPI `on_event` 弃用警告，位于 `app.py:147` 与 `app.py:179`，不属于本次 gateway 缺陷修复路径。
@@ -44,6 +44,8 @@ git diff --check
 - warming backend 仅在 readiness 成功后可参与路由。
 - backend routing score 对高失败率 backend 增加惩罚。
 - probe failure 与流量失败计数分开跟踪。
+- 自动部署在没有可接管后端时跳过销毁旧 Claw，避免创建新 Claw 的 5-10 分钟内出现 no backend 空窗。
+- 默认轮换时间改为 40 分钟，给 1 小时上游硬断前留出更保守的创建与热身窗口。
 
 ## 清理
 

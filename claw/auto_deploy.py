@@ -64,15 +64,22 @@ def _fmt_claw_reply(reply: str) -> str:
     return reply[:200] + "..." if len(reply) > 200 else reply
 
 
-def _notify_gateway_deploy_start(account_filename: str, api_port: int, log: "DeployLogger") -> None:
-    """Drain the soon-to-be-replaced backend before destroying its Claw."""
+def _notify_gateway_deploy_start(account_filename: str, api_port: int, log: "DeployLogger") -> dict:
+    """Drain the soon-to-be-replaced backend before destroying its Claw.
+
+    Claw recreation can take 5-10 minutes. If there is no selectable peer that
+    can take the same model traffic, destroying the old Claw would create a
+    guaranteed no-backend window, so this hook returns ``safe_to_destroy=False``.
+    """
+    failed = {"safe_to_destroy": False, "matched": [], "drained": [], "blocked": []}
     try:
         from gateway.runtime import prepare_account_deploy
         result = prepare_account_deploy(account_filename, api_port=api_port)
     except Exception as e:  # noqa: BLE001
-        log.log(f"⚠️ Gateway 预切换失败，将继续部署: {type(e).__name__}: {e}")
+        log.log(f"⚠️ Gateway 预切换失败，跳过销毁旧 Claw: {type(e).__name__}: {e}")
         logger_module.exception("Gateway deploy-start hook failed for %s", account_filename)
-        return
+        return failed
+
     matched = result.get("matched") or []
     drained = result.get("drained") or []
     blocked = result.get("blocked") or []
@@ -85,15 +92,25 @@ def _notify_gateway_deploy_start(account_filename: str, api_port: int, log: "Dep
             if pending:
                 log.log(f"⚠️ Gateway drain 等待超时，仍有 in-flight: {', '.join(pending)}")
             else:
-                log.log("Gateway drain 完成，开始替换 Claw")
+                log.log("Gateway drain 完成，可以替换 Claw")
         except Exception as e:  # noqa: BLE001
-            log.log(f"⚠️ Gateway drain 等待失败，将继续部署: {type(e).__name__}: {e}")
+            log.log(f"⚠️ Gateway drain 等待失败，跳过销毁旧 Claw: {type(e).__name__}: {e}")
+            result["safe_to_destroy"] = False
+            return result
     elif matched and blocked:
-        log.log(f"⚠️ Gateway 未找到可接管的 active peer，无法预切换: {', '.join(blocked)}")
+        log.log(
+            "⚠️ Gateway 没有可接管的健康后端，跳过销毁旧 Claw，避免 no backend 窗口: "
+            + ", ".join(blocked)
+        )
     elif matched:
         log.log(f"Gateway 后端已处于非 active 状态，跳过预切换: {', '.join(matched)}")
     else:
-        log.log("⚠️ Gateway 未匹配到该账号/API 端口的后端，部署完成后可能需要检查后端配置")
+        log.log("⚠️ Gateway 未匹配到该账号/API 端口的后端，跳过销毁旧 Claw")
+        result["safe_to_destroy"] = False
+        return result
+
+    result["safe_to_destroy"] = bool(result.get("safe_to_destroy", not blocked))
+    return result
 
 
 def _notify_gateway_deploy_done(account_filename: str, api_port: int, log: "DeployLogger") -> None:
@@ -130,9 +147,10 @@ def _notify_gateway_deploy_failed(account_filename: str, api_port: int, error: s
         log.log(f"Gateway 已暂时移除失败的部署后端: {', '.join(failed)}")
 
 
-# Stale-deploy entries (state ∈ done/error/cancelled) older than this are
+# Stale-deploy entries (state ∈ done/error/cancelled/skipped) older than this are
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
 _STALE_AFTER_S = 300
+_TERMINAL_STATES = ("done", "error", "cancelled", "skipped")
 
 # Per-step timing knobs.
 _DESTROY_POLL_INTERVAL_S = 5
@@ -334,7 +352,7 @@ def get_deploy_status(account_filename: str = None) -> dict:
         d = _active_deploys.get(account_filename)
         if d:
             return {
-                "running": d.get("state") not in ("done", "error", "cancelled"),
+                "running": d.get("state") not in _TERMINAL_STATES,
                 "state": d["state"],
                 "log": d["logger"].get_recent(50),
             }
@@ -342,7 +360,7 @@ def get_deploy_status(account_filename: str = None) -> dict:
     result = {}
     for acc, d in _active_deploys.items():
         result[acc] = {
-            "running": d.get("state") not in ("done", "error", "cancelled"),
+            "running": d.get("state") not in _TERMINAL_STATES,
             "state": d["state"],
             "log": d["logger"].get_recent(20),
         }
@@ -633,8 +651,15 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             mark_finished("error", history_status="error")
             return
 
-        _notify_gateway_deploy_start(account_filename, api_port, log)
+        deploy_start = _notify_gateway_deploy_start(account_filename, api_port, log)
         gateway_prepared = True
+        if not deploy_start.get("safe_to_destroy", False):
+            log.log(
+                "本次自动部署已跳过：新 Claw 创建需要 5-10 分钟，"
+                "当前没有可接管后端，继续会导致 no backend。"
+            )
+            mark_finished("skipped", history_status="skipped")
+            return
 
         # Step 0: Destroy existing claw if any.
         set_state("step0_destroy")
@@ -934,7 +959,7 @@ def trigger_deploy(account_filename: str) -> dict:
     """Manually start a deployment (returns immediately; runs in a thread)."""
     _gc_active_deploys()
     cur = _active_deploys.get(account_filename)
-    if cur and cur.get("state") not in ("done", "error", "cancelled", "idle"):
+    if cur and cur.get("state") not in (*_TERMINAL_STATES, "idle"):
         return {"success": False, "error": "该账号正在部署中"}
     t = threading.Thread(
         target=_run_deploy_thread, args=(account_filename, False), daemon=True,
@@ -945,7 +970,7 @@ def trigger_deploy(account_filename: str) -> dict:
 
 def cancel_deploy(account_filename: str) -> dict:
     d = _active_deploys.get(account_filename)
-    if d and d.get("state") not in ("done", "error", "cancelled"):
+    if d and d.get("state") not in _TERMINAL_STATES:
         d["cancel"].set()
         d["state"] = "cancelling"
         return {"success": True, "message": "正在取消..."}
@@ -988,7 +1013,7 @@ def _scheduler_loop():
                     # the previous run finished quickly (issue #5 fix).
                     continue
                 cur = _active_deploys.get(acc_filename)
-                if cur and cur.get("state") not in ("done", "error", "cancelled"):
+                if cur and cur.get("state") not in _TERMINAL_STATES:
                     continue
                 print(f"[scheduler] 触发 {acc_filename} 的部署", flush=True)
                 cfg["accounts"][acc_filename]["last_run"] = now.timestamp()

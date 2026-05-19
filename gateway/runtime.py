@@ -57,9 +57,10 @@ _PROBE_CONCURRENCY = 10
 _DEFAULT_REQUEST_TIMEOUT_S = 600.0
 _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
 
-# Account-rotation defaults. Cloud deployments are expected to live for about
-# one hour; rotate at 50 minutes to leave room for deploy + readiness checks.
-_ROTATION_INTERVAL_S = 50 * 60.0
+# Account-rotation defaults. Upstream Claw sessions are cut at about one hour,
+# and a fresh Claw can take 5-10 minutes to become usable. Rotate at 40 minutes
+# by default so deployment has enough runway before the hard disconnect.
+_ROTATION_INTERVAL_S = _env_float("GATEWAY_ROTATION_INTERVAL_S", 40 * 60.0)
 _READINESS_INTERVAL_S = 10.0
 _READINESS_REQUIRED_SUCCESSES = 1
 _DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
@@ -184,7 +185,7 @@ def reload_backends() -> int:
         seen.add(fresh.backend_id)
         existing = _registry.get(fresh.backend_id)
         if existing is None:
-            if fresh.lifecycle == "warming" and not _has_active_peer(fresh):
+            if fresh.lifecycle == "warming" and not _has_selectable_peer(fresh):
                 fresh.mark_active(now=now)
             elif fresh.lifecycle == "active":
                 fresh.mark_active(now=now)
@@ -233,6 +234,19 @@ def _has_active_peer(candidate: Backend) -> bool:
         and b.enabled
         and b.lifecycle == "active"
         and bool(c_models.intersection(b.models))
+        for b in _registry.all()
+    )
+
+
+def _has_selectable_peer(candidate: Backend, *, now: float | None = None) -> bool:
+    """Return whether another backend can safely take new traffic now."""
+    assert _registry is not None
+    c_models = set(candidate.models)
+    n = now or time.time()
+    return any(
+        b.backend_id != candidate.backend_id
+        and bool(c_models.intersection(b.models))
+        and b.is_selectable(n)
         for b in _registry.all()
     )
 
@@ -389,7 +403,10 @@ def prepare_account_deploy(account_id: str, *, api_port: int | None = None) -> d
     destroys the old Claw/tunnel, clients see avoidable 5xxs until the next
     manual reload or health-probe cycle. This helper is intentionally sync so
     the deploy thread can call it before touching the old Claw: active matching
-    backends are drained only when another active peer can serve their models.
+    backends are drained only when another selectable peer can serve their
+    models. If no peer is selectable, callers must not destroy the old Claw:
+    keeping degraded capacity is safer than creating a guaranteed no-backend
+    window during the 5-10 minute Claw creation path.
     """
     _ensure_initialized()
     assert _registry is not None
@@ -399,7 +416,7 @@ def prepare_account_deploy(account_id: str, *, api_port: int | None = None) -> d
     for backend in targets:
         if backend.lifecycle != "active":
             continue
-        if not _has_active_peer(backend):
+        if not _has_selectable_peer(backend):
             blocked.append(backend.backend_id)
             continue
         backend.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S)
@@ -412,6 +429,7 @@ def prepare_account_deploy(account_id: str, *, api_port: int | None = None) -> d
         "matched": [b.backend_id for b in targets],
         "drained": drained,
         "blocked": blocked,
+        "safe_to_destroy": not blocked,
     }
 
 
@@ -450,7 +468,7 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
         backend.health = "alive"
         backend.consecutive_failures = 0
         backend.last_error = ""
-        if _has_active_peer(backend):
+        if _has_selectable_peer(backend):
             backend.mark_warming(now=now)
             backend.last_probe_at = 0.0
             warmed.append(backend.backend_id)
@@ -477,7 +495,7 @@ def fail_account_deploy(account_id: str, *, api_port: int | None = None, error: 
     targets = _matching_account_backends(account_id, api_port=api_port)
     failed: list[str] = []
     for backend in targets:
-        if backend.lifecycle == "active" and not _has_active_peer(backend):
+        if backend.lifecycle == "active" and not _has_selectable_peer(backend):
             # Single-backend installs have no failover target; leave the backend
             # visible so the router can recover if the old tunnel is still alive.
             continue
@@ -631,7 +649,7 @@ def _promote_standby_backends_to_warming() -> None:
     for b in _registry.all():
         if not b.enabled or b.lifecycle != "standby" or b.is_temporarily_disabled(now):
             continue
-        if _has_active_peer(b):
+        if _has_selectable_peer(b):
             b.mark_warming(now=now)
         else:
             # If this model currently has no active capacity, avoid leaving the
