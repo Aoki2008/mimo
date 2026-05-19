@@ -35,6 +35,7 @@ from typing import Any, Protocol
 
 from gateway.adapters import OpenAIChatAdapter, ProtocolAdapter, UpstreamCodec
 from gateway.anthropic_passthrough import (
+    normalize_tool_choice,
     patch_request_thinking,
     scan_response_json,
     tee_stream_capture_thinking,
@@ -45,6 +46,7 @@ from gateway.core import (
     BadRequestError,
     GatewayError,
     InternalEvent,
+    InternalRequest,
     ModelNotFoundError,
     RequestContext,
     UpstreamError,
@@ -157,6 +159,8 @@ class GatewayHandler:
             req.model = native
             ctx.model = native
 
+        self._validate_request_shape(req)
+
         upstream_body = self._codec.serialize_to_upstream(req)
         # Conversation-scope key derived from this request's full message
         # history *and* tool surface. The codec writes captured reasoning
@@ -167,12 +171,21 @@ class GatewayHandler:
         # attacker who guesses a tool_id can't pull another conversation's
         # reasoning out of the cache.
         from gateway.adapters.openai_chat import _conversation_key_for_request
-        conversation_key = _conversation_key_for_request(
+        scoped_conversation_key = _conversation_key_for_request(
             req.messages,
             tools=req.tools,
             tool_choice=req.tool_choice,
             thinking=req.metadata.get("thinking") if req.metadata else None,
         )
+        fallback_conversation_key = _conversation_key_for_request(
+            req.messages,
+            tools=req.tools,
+            tool_choice=req.tool_choice,
+            thinking=None,
+        )
+        conversation_key: str | list[str] = scoped_conversation_key
+        if fallback_conversation_key != scoped_conversation_key:
+            conversation_key = [scoped_conversation_key, fallback_conversation_key]
 
         if req.stream:
             return await self._handle_stream_with_retries(
@@ -226,6 +239,11 @@ class GatewayHandler:
             body["model"] = native
             ctx.model = native
 
+        try:
+            normalize_tool_choice(body)
+        except ValueError as e:
+            raise BadRequestError(str(e)) from e
+
         # Rehydrate missing thinking blocks before sending to upstream.
         # patch_request_thinking computes its own per-assistant-message
         # prefix hashes internally — it walks ``body["messages"]`` and
@@ -272,7 +290,7 @@ class GatewayHandler:
     async def _handle_anthropic_non_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         model: str, upstream_body: dict[str, Any],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -305,7 +323,7 @@ class GatewayHandler:
     async def _handle_anthropic_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body: dict[str, Any], headers: dict[str, str],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -331,8 +349,7 @@ class GatewayHandler:
             ctx.upstream_status = status
 
             if status >= 400:
-                if status >= 500:
-                    backend.record_failure(f"upstream http {status}")
+                self._record_upstream_http_failure(backend, status, raw)
                 self._record_metric(ctx, backend.backend_id, status,
                                     (time.monotonic() - started) * 1000,
                                     error=f"http {status}")
@@ -361,7 +378,7 @@ class GatewayHandler:
     async def _handle_anthropic_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         model: str, upstream_body: dict[str, Any],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -394,7 +411,7 @@ class GatewayHandler:
     async def _handle_anthropic_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body: dict[str, Any], headers: dict[str, str],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -425,8 +442,7 @@ class GatewayHandler:
                     pass
             except Exception:
                 pass
-            if status >= 500:
-                backend.record_failure(f"upstream http {status}")
+            self._record_upstream_http_failure(backend, status, b"")
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, status,
                                 (time.monotonic() - started) * 1000,
@@ -513,7 +529,7 @@ class GatewayHandler:
 
     async def _handle_non_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -545,13 +561,13 @@ class GatewayHandler:
     def _is_retryable_non_stream(err: GatewayError) -> bool:
         status = err.details.get("status") if getattr(err, "details", None) else None
         if isinstance(status, int):
-            return status >= 500
+            return status == 401 or status >= 500
         return getattr(err, "http_status", 500) in (502, 503, 504)
 
     async def _handle_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body, headers,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -580,8 +596,7 @@ class GatewayHandler:
                 # 4xx normally means the request payload/auth was rejected by
                 # upstream. Do not poison backend health or rotate traffic across
                 # otherwise healthy nodes for client/gateway request-shape bugs.
-                if status >= 500:
-                    backend.record_failure(f"upstream http {status}")
+                self._record_upstream_http_failure(backend, status, raw)
                 self._record_metric(ctx, backend.backend_id, status,
                                     (time.monotonic() - started) * 1000,
                                     error=f"http {status}")
@@ -616,7 +631,7 @@ class GatewayHandler:
 
     async def _handle_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         """Stream with retry on pre-stream failures.
 
@@ -653,14 +668,14 @@ class GatewayHandler:
     def _is_retryable_stream(err: GatewayError) -> bool:
         status = err.details.get("status") if getattr(err, "details", None) else None
         if isinstance(status, int):
-            return status >= 500
+            return status == 401 or status >= 500
         # Connection errors / timeouts have no status — retry them too.
         return getattr(err, "http_status", 500) in (502, 503, 504)
 
     async def _handle_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body, headers,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -691,8 +706,7 @@ class GatewayHandler:
                     pass
             except Exception:
                 pass
-            if status >= 500:
-                backend.record_failure(f"upstream http {status}")
+            self._record_upstream_http_failure(backend, status, b"")
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, status,
                                 (time.monotonic() - started) * 1000,
@@ -775,6 +789,26 @@ class GatewayHandler:
         except Exception:
             pass
 
+    @staticmethod
+    def _record_upstream_http_failure(backend, status: int, raw: bytes) -> None:
+        """Update backend health for upstream errors that prove backend failure."""
+        if status == 401:
+            backend.record_failure(f"upstream auth failed: {_upstream_error_param(raw)}")
+        elif status >= 500:
+            backend.record_failure(f"upstream http {status}")
+
+    @staticmethod
+    def _validate_request_shape(req: InternalRequest) -> None:
+        if _is_tts_model(req.model):
+            if any(m.role == "system" for m in req.messages):
+                raise BadRequestError("TTS model requests must not include system messages")
+            if not any(m.role == "assistant" for m in req.messages):
+                raise BadRequestError("TTS model requests must include an assistant message")
+        if _request_has_image(req) and not _is_vision_model(req.model):
+            raise BadRequestError(
+                f"Model {req.model!r} does not support image input; use a vision model"
+            )
+
 
 def _content_type_for(adapter: ProtocolAdapter, *, stream: bool) -> str:
     if stream:
@@ -782,6 +816,39 @@ def _content_type_for(adapter: ProtocolAdapter, *, stream: bool) -> str:
     if adapter.name == "anthropic":
         return "application/json"
     return "application/json"
+
+
+def _upstream_error_param(raw: bytes) -> str:
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    error = data.get("error")
+    if not isinstance(error, dict):
+        return ""
+    value = error.get("param") or error.get("message") or ""
+    return str(value)[:120]
+
+
+def _is_tts_model(model: str) -> bool:
+    return "tts" in (model or "").lower()
+
+
+def _is_vision_model(model: str) -> bool:
+    lowered = (model or "").lower()
+    return any(marker in lowered for marker in ("vl", "vision", "image"))
+
+
+def _request_has_image(req: InternalRequest) -> bool:
+    return any(
+        content.type == "image"
+        for message in req.messages
+        for content in message.content
+    )
 
 
 def _extract_token_counts(events) -> tuple[int, int]:

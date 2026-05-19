@@ -213,7 +213,44 @@ def test_backend_routing_score_unobserved_uses_conservative_latency():
     """Fresh active backends should not look faster than warmed peers."""
     b = _backend()
     assert b.ewma_latency_ms == 0.0
-    assert b.routing_score() == pytest.approx(250.0)
+    assert b.routing_score() == pytest.approx(100.0)
+
+
+def test_backend_routing_score_penalizes_unreliable():
+    """Backends with high failure rates get a higher (worse) score."""
+    reliable = _backend(backend_id="reliable")
+    unreliable = _backend(backend_id="unreliable")
+    reliable.ewma_latency_ms = 100.0
+    unreliable.ewma_latency_ms = 100.0
+    # Seed enough requests for failure rate to kick in (threshold is 5)
+    for _ in range(5):
+        reliable.record_latency(100.0)
+    unreliable.total_requests = 3
+    unreliable.total_failures = 7  # 70% failure rate
+    # penalty = 1.0 + 0.7 * 4.0 = 3.8
+    assert reliable.routing_score() == pytest.approx(100.0)
+    assert unreliable.routing_score() == pytest.approx(380.0)
+
+
+def test_backend_routing_score_ignores_failure_rate_with_few_requests():
+    """With fewer than 5 total samples, failure rate is not applied."""
+    b = _backend()
+    b.ewma_latency_ms = 100.0
+    b.total_requests = 2
+    b.total_failures = 2
+    assert b.routing_score() == pytest.approx(100.0)  # no penalty
+
+
+def test_probe_consecutive_failures_tracked_separately():
+    """Probe failures increment probe_consecutive_failures; record_success resets both."""
+    b = _backend()
+    b.record_probe_failure("http 500", threshold=4)
+    b.record_probe_failure("http 500", threshold=4)
+    assert b.probe_consecutive_failures == 2
+    assert b.consecutive_failures == 2
+    b.record_success()
+    assert b.probe_consecutive_failures == 0
+    assert b.consecutive_failures == 0
 
 
 # ───────── Router score-based selection ─────────

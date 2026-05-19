@@ -39,21 +39,26 @@ def _backend(backend_id: str, *, lifecycle: str = "active") -> Backend:
     return b
 
 
-def test_router_excludes_warming_and_draining_backends():
+def test_router_excludes_draining_and_unready_warming_backends():
     active = _backend("active")
-    warming = _backend("warming", lifecycle="warming")
+    warming_ready = _backend("warming-ready", lifecycle="warming")
+    warming_ready.readiness_successes = 1  # passed readiness
+    warming_unready = _backend("warming-unready", lifecycle="warming")
+    warming_unready.readiness_successes = 0  # no readiness success yet
     draining = _backend("draining", lifecycle="draining")
-    router = Router(BackendRegistry([warming, draining, active]))
+    router = Router(BackendRegistry([warming_unready, warming_ready, draining, active]))
 
     chosen, decision = router.choose(request_id="r1", model="mimo-v2.5-pro")
 
-    assert chosen.backend_id == "active"
-    assert decision.excluded["warming"] == "lifecycle=warming"
+    assert chosen.backend_id in ("active", "warming-ready")
     assert decision.excluded["draining"] == "lifecycle=draining"
+    assert decision.excluded["warming-unready"] == "warming, no readiness success yet"
 
 
 def test_router_raises_when_only_warming_backend_exists():
-    router = Router(BackendRegistry([_backend("warming", lifecycle="warming")]))
+    b = _backend("warming", lifecycle="warming")
+    b.readiness_successes = 0  # no readiness success yet
+    router = Router(BackendRegistry([b]))
 
     with pytest.raises(BackendUnavailableError):
         router.choose(request_id="r1", model="mimo-v2.5-pro")
@@ -234,6 +239,23 @@ def test_prepare_account_deploy_blocks_when_no_peer_exists(monkeypatch):
     assert only.lifecycle == "active"
 
 
+def test_prepare_account_deploy_blocks_when_peer_is_not_selectable(monkeypatch):
+    old = _backend("old")
+    old.account_id = "alice"
+    peer = _backend("peer")
+    peer.account_id = "bob"
+    peer.in_detection = True
+    reg = BackendRegistry([old, peer])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    result = runtime.prepare_account_deploy("alice")
+
+    assert result["drained"] == []
+    assert result["blocked"] == ["old"]
+    assert old.lifecycle == "active"
+
+
 def test_promote_standby_backends_to_warming_fills_load_balancing_pool(monkeypatch):
     active = _backend("active")
     standby = _backend("standby", lifecycle="standby")
@@ -290,3 +312,7 @@ def test_complete_account_deploy_activates_when_no_peer_exists(monkeypatch):
     assert result["warmed"] == []
     assert result["activated"] == ["only"]
     assert only.lifecycle == "active"
+
+
+def test_rotation_interval_defaults_to_40_minutes():
+    assert runtime._ROTATION_INTERVAL_S == 40 * 60.0
