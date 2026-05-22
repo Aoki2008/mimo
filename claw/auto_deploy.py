@@ -1187,7 +1187,8 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             f"(model={_PROBE_API_CHAT_MODEL}, thinking_budget={_PROBE_API_CHAT_THINKING_BUDGET}, "
             f"timeout={_PROBE_API_CHAT_TIMEOUT_S}s) ..."
         )
-        endpoint_ok = False
+        health_ok = False
+        chat_ok = False
         last_reason = ""
         for i in range(_PROBE_API_MAX_ITERS):
             if cancelled():
@@ -1197,13 +1198,14 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             ok, reason = await _probe_api_health(api_port)
             last_reason = reason
             if ok:
+                health_ok = True
                 log.log(f"✅ API health 已就绪: {reason}")
                 break
             log.log(f"  等待 API health... ({(i + 1) * _PROBE_API_INTERVAL_S}s, {reason})")
         else:
             log.log(f"⚠️ API health 等待超时 (最后状态: {last_reason})")
 
-        if "health HTTP 200" in last_reason:
+        if health_ok:
             for i in range(_PROBE_API_CHAT_MAX_ITERS):
                 if cancelled():
                     mark_finished("cancelled", history_status="cancelled")
@@ -1215,7 +1217,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                 )
                 last_reason = reason
                 if ok:
-                    endpoint_ok = True
+                    chat_ok = True
                     log.log(f"✅ API chat 探测通过: {reason}")
                     break
                 log.log(
@@ -1224,12 +1226,19 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                 if i + 1 < _PROBE_API_CHAT_MAX_ITERS:
                     await asyncio.sleep(_PROBE_API_INTERVAL_S)
 
-        if endpoint_ok:
+        if health_ok:
             _notify_gateway_deploy_done(account_filename, api_port, log)
-            log.log("=== ✅ 部署完成 ===")
+            if chat_ok:
+                log.log("=== ✅ 部署完成 ===")
+            else:
+                log.log(
+                    f"⚠️ API chat 探测超时/失败 (最后状态: {last_reason})，"
+                    "基础部署已完成，模型链路暂不可用/待后续探测恢复"
+                )
+                log.log("=== ✅ 部署完成（chat 探测 warning）===")
             mark_finished("done", history_status="done")
         else:
-            log.log(f"⚠️ API chat 探测超时/失败 (最后状态: {last_reason})，Claw 已就绪但模型链路不可用")
+            log.log(f"⚠️ API health 探测超时/失败 (最后状态: {last_reason})，Claw 已就绪但 API 端点不可用")
             mark_finished("error", history_status="error")
 
     except asyncio.CancelledError:
