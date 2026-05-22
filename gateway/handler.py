@@ -35,6 +35,7 @@ from typing import Any, Protocol
 
 from gateway.adapters import OpenAIChatAdapter, ProtocolAdapter, UpstreamCodec
 from gateway.anthropic_passthrough import (
+    normalize_tool_choice,
     patch_request_thinking,
     scan_response_json,
     tee_stream_capture_thinking,
@@ -45,6 +46,7 @@ from gateway.core import (
     BadRequestError,
     GatewayError,
     InternalEvent,
+    InternalRequest,
     ModelNotFoundError,
     RequestContext,
     UpstreamError,
@@ -167,12 +169,21 @@ class GatewayHandler:
         # attacker who guesses a tool_id can't pull another conversation's
         # reasoning out of the cache.
         from gateway.adapters.openai_chat import _conversation_key_for_request
-        conversation_key = _conversation_key_for_request(
+        scoped_conversation_key = _conversation_key_for_request(
             req.messages,
             tools=req.tools,
             tool_choice=req.tool_choice,
             thinking=req.metadata.get("thinking") if req.metadata else None,
         )
+        fallback_conversation_key = _conversation_key_for_request(
+            req.messages,
+            tools=req.tools,
+            tool_choice=req.tool_choice,
+            thinking=None,
+        )
+        conversation_key: str | list[str] = scoped_conversation_key
+        if fallback_conversation_key != scoped_conversation_key:
+            conversation_key = [scoped_conversation_key, fallback_conversation_key]
 
         if req.stream:
             return await self._handle_stream_with_retries(
@@ -230,6 +241,7 @@ class GatewayHandler:
         # patch_request_thinking computes its own per-assistant-message
         # prefix hashes internally — it walks ``body["messages"]`` and
         # scopes each lookup to the prefix up to that turn.
+        normalize_tool_choice(body)
         patch_request_thinking(body)
 
         # Response-side capture uses one key derived from the full body we
@@ -272,7 +284,7 @@ class GatewayHandler:
     async def _handle_anthropic_non_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         model: str, upstream_body: dict[str, Any],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -305,7 +317,7 @@ class GatewayHandler:
     async def _handle_anthropic_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body: dict[str, Any], headers: dict[str, str],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -355,7 +367,7 @@ class GatewayHandler:
     async def _handle_anthropic_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         model: str, upstream_body: dict[str, Any],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -388,7 +400,7 @@ class GatewayHandler:
     async def _handle_anthropic_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body: dict[str, Any], headers: dict[str, str],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -499,7 +511,7 @@ class GatewayHandler:
 
     async def _handle_non_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -537,7 +549,7 @@ class GatewayHandler:
     async def _handle_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body, headers,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -596,7 +608,7 @@ class GatewayHandler:
 
     async def _handle_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         """Stream with retry on pre-stream failures.
 
@@ -640,7 +652,7 @@ class GatewayHandler:
     async def _handle_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body, headers,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()

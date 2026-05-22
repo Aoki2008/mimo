@@ -48,7 +48,7 @@ def test_router_excludes_warming_and_draining_backends():
     chosen, decision = router.choose(request_id="r1", model="mimo-v2.5-pro")
 
     assert chosen.backend_id == "active"
-    assert decision.excluded["warming"] == "lifecycle=warming"
+    assert decision.excluded["warming"] == "warming, no readiness success yet"
     assert decision.excluded["draining"] == "lifecycle=draining"
 
 
@@ -159,8 +159,8 @@ def test_tool_readiness_accepts_structural_json_response():
     ok, reason = runtime._raw_response_is_valid(
         b'{"choices":[{"message":{"content":"no tool"}}]}'
     )
-    assert ok is True
-    assert reason == "ok"
+    assert ok is False
+    assert "no tool call" in reason
 
 
 def test_readiness_without_models_fails_explicitly(monkeypatch):

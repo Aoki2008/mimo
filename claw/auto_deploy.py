@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -133,6 +134,11 @@ def _notify_gateway_deploy_failed(account_filename: str, api_port: int, error: s
 # Stale-deploy entries (state ∈ done/error/cancelled) older than this are
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
 _STALE_AFTER_S = 300
+
+# 上游 Claw 连接约 1 小时会被硬断，提前轮换给 5-10 分钟冷启动留余量。
+_ROTATION_TARGET_AGE_S = 40 * 60
+_ROTATION_CRITICAL_AGE_S = 50 * 60
+_ROTATION_HARD_EXPIRY_AGE_S = 55 * 60
 
 # Per-step timing knobs.
 _DESTROY_POLL_INTERVAL_S = 5
@@ -334,6 +340,107 @@ def _gc_active_deploys() -> None:
     ]
     for acc in stale:
         _active_deploys.pop(acc, None)
+
+
+# ─── Rotation status helpers (read-only) ───
+
+def _rotation_policy(enabled_count: int) -> dict:
+    enabled = max(0, int(enabled_count or 0))
+    if enabled <= 0:
+        return {"desired_active": 0, "normal_min_active": 0, "emergency_min_active": 0}
+    normal_min = min(enabled, max(3, int(math.ceil(enabled * 0.80))))
+    emergency_min = min(enabled, max(3, int(math.floor(enabled * 0.67))))
+    return {
+        "desired_active": enabled,
+        "normal_min_active": normal_min,
+        "emergency_min_active": emergency_min,
+    }
+
+
+def _rotation_reason(age_s: float) -> str:
+    if age_s >= _ROTATION_HARD_EXPIRY_AGE_S:
+        return "hard_expiry_age"
+    if age_s >= _ROTATION_CRITICAL_AGE_S:
+        return "critical_age"
+    if age_s >= _ROTATION_TARGET_AGE_S:
+        return "target_age"
+    return "fresh"
+
+
+def _load_rotation_status(cfg: dict) -> dict:
+    """Compute per-account rotation status from gateway backends (read-only)."""
+    accounts_cfg = cfg.get("accounts", {}) or {}
+    enabled_accounts = [
+        acc for acc, acc_cfg in accounts_cfg.items()
+        if acc_cfg.get("enabled", False)
+    ]
+    enabled_count = len(enabled_accounts)
+    policy = _rotation_policy(enabled_count)
+
+    backends: list[dict] = []
+    try:
+        from gateway.runtime import get_all_backends
+        backends = get_all_backends()
+    except Exception:
+        pass
+
+    def _backend_url_port(backend: dict) -> int | None:
+        m = re.search(r":(\d+)(?:/)?$", str(backend.get("url") or "").rstrip("/"))
+        return int(m.group(1)) if m else None
+
+    def _account_match_keys(filename: str) -> set[str]:
+        raw = (filename or "").strip()
+        keys = {raw} if raw else set()
+        if raw.endswith(".json"):
+            keys.add(raw[:-5])
+        elif raw:
+            keys.add(f"{raw}.json")
+        return keys
+
+    active_selectable = 0
+    account_status: dict[str, dict] = {}
+
+    for account in enabled_accounts:
+        acc_cfg = accounts_cfg.get(account, {})
+        keys = _account_match_keys(account)
+        api_port = acc_cfg.get("api_port")
+        matches = [
+            b for b in backends
+            if (str(b.get("account") or "") in keys)
+            or (api_port is not None and _backend_url_port(b) == api_port)
+        ]
+        selectable = [
+            b for b in matches
+            if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") in ("active", "warming")
+        ]
+        age_s = max((float(b.get("active_for_s") or 0) for b in selectable), default=0.0)
+        reason = _rotation_reason(age_s)
+        status = {
+            "enabled": True,
+            "api_port": api_port,
+            "active": bool(selectable),
+            "backend_count": len(matches),
+            "selectable_backend_count": len(selectable),
+            "age_s": int(age_s),
+            "age_min": round(age_s / 60.0, 1) if age_s else 0,
+            "next_rotation_reason": reason,
+            "skip_reason": "" if selectable else ("no_selectable_backend" if matches else "skipped_unmatched"),
+        }
+        account_status[account] = status
+        if selectable:
+            active_selectable += 1
+
+    return {
+        "policy": policy,
+        "counts": {
+            "enabled_accounts": enabled_count,
+            "desired_active": policy["desired_active"],
+            "active_selectable": active_selectable,
+            "normal_min_active": policy["normal_min_active"],
+            "emergency_min_active": policy["emergency_min_active"],
+        },
+        "accounts": account_status,
+    }
 
 
 def get_deploy_status(account_filename: str = None) -> dict:
@@ -1235,10 +1342,19 @@ def get_scheduler_status() -> dict:
     accounts = cfg.get("accounts", {})
     schedule_info = {}
     now = datetime.now()
+    rotation = _load_rotation_status(cfg)
+    rotation_accounts = rotation.get("accounts") or {}
 
     for acc_filename, acc_cfg in accounts.items():
+        rotation_info = rotation_accounts.get(acc_filename, {})
         if not acc_cfg.get("enabled", False):
-            schedule_info[acc_filename] = {"enabled": False}
+            schedule_info[acc_filename] = {
+                "enabled": False,
+                "age_s": 0,
+                "age_min": 0,
+                "next_rotation_reason": "disabled",
+                "skip_reason": "disabled",
+            }
             continue
         cron_expr = acc_cfg.get("cron", "0 3 * * *")
         last_run = acc_cfg.get("last_run", 0)
@@ -1249,6 +1365,7 @@ def get_scheduler_status() -> dict:
             schedule_info[acc_filename] = {
                 "enabled": True, "cron": cron_expr,
                 "error": "Cron 表达式格式错误",
+                **rotation_info,
             }
             continue
         schedule_info[acc_filename] = {
@@ -1259,9 +1376,13 @@ def get_scheduler_status() -> dict:
                 if last_run else "从未运行"
             ),
             "next_run": next_run.strftime("%Y-%m-%d %H:%M"),
+            **rotation_info,
         }
 
     return {
         "scheduler_running": _scheduler_running,
+        "schedule_mode": "adaptive",
+        "policy": rotation.get("policy", {}),
+        "counts": rotation.get("counts", {}),
         "accounts": schedule_info,
     }
