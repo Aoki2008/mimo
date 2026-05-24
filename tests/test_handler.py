@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from gateway.adapters import OpenAIChatAdapter
-from gateway.core import AuthError, RequestContext
+from gateway.adapters import AnthropicAdapter, OpenAIChatAdapter, OpenAIResponsesAdapter
+from gateway.core import AuthError, BadRequestError, RequestContext
 from gateway.handler import GatewayHandler
 from gateway.routing import Backend, BackendRegistry, Router
 
@@ -111,7 +111,15 @@ def test_non_stream_4xx_does_not_mark_backend_failure(monkeypatch):
     monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
     backend = Backend(backend_id="a", base_url="http://a", models=["m"])
     backend.record_success()
-    transport = FakeTransport({"http://a/v1/chat/completions": (400, b"bad request")})
+    raw = json.dumps({
+        "error": {
+            "code": "400",
+            "message": "Param Incorrect",
+            "param": "tools[6] is missing function.name",
+            "type": "",
+        }
+    }).encode()
+    transport = FakeTransport({"http://a/v1/chat/completions": (400, raw)})
     metrics = FakeMetrics()
     handler = GatewayHandler(
         router=Router(BackendRegistry([backend])),
@@ -119,10 +127,11 @@ def test_non_stream_4xx_does_not_mark_backend_failure(monkeypatch):
         metrics=metrics,
     )
 
-    from gateway.core import UpstreamError
-    with pytest.raises(UpstreamError):
+    with pytest.raises(BadRequestError) as exc:
         asyncio.run(handler.handle(RequestContext(), OpenAIChatAdapter(), _body()))
 
+    assert exc.value.message == "客户端请求体参数不符合 MiMo API 要求"
+    assert exc.value.details["upstream_error"]["param"] == "tools[6] is missing function.name"
     assert backend.total_failures == 0
     assert backend.health == "alive"
     assert metrics.rows[0]["status_code"] == 400
@@ -173,3 +182,157 @@ def test_user_request_success_does_not_update_backend_rating(monkeypatch):
     assert backend.health == "alive"
     assert backend.total_requests == before_successes
     assert backend.ewma_latency_ms == 123.0
+
+
+def test_openai_image_request_rejected_for_text_model_before_routing(monkeypatch):
+    monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
+    backend = Backend(backend_id="a", base_url="http://a", models=["mimo-v2.5-pro"])
+    backend.record_success()
+    transport = FakeTransport({
+        "http://a/v1/chat/completions": (200, _payload("mimo-v2.5-pro")),
+    })
+    handler = GatewayHandler(
+        router=Router(BackendRegistry([backend])),
+        transport=transport,
+    )
+    body = {
+        "model": "mimo-v2.5-pro",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }],
+    }
+
+    with pytest.raises(BadRequestError) as exc:
+        asyncio.run(handler.handle(RequestContext(), OpenAIChatAdapter(), body))
+
+    assert "该模型不支持多模态输入" in exc.value.message
+    assert transport.calls == []
+
+
+def test_openai_image_request_allowed_for_mimo_multimodal_model(monkeypatch):
+    monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
+    backend = Backend(backend_id="a", base_url="http://a", models=["mimo-v2-omni"])
+    backend.record_success()
+    transport = FakeTransport({
+        "http://a/v1/chat/completions": (200, _payload("mimo-v2-omni")),
+    })
+    handler = GatewayHandler(
+        router=Router(BackendRegistry([backend])),
+        transport=transport,
+    )
+    body = {
+        "model": "mimo-v2-omni",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }],
+    }
+
+    content_type, stream, raw = asyncio.run(
+        handler.handle(RequestContext(), OpenAIChatAdapter(), body)
+    )
+
+    assert content_type == "application/json"
+    assert stream is None
+    assert json.loads(raw)["choices"][0]["message"]["content"] == "ok"
+    assert transport.calls == ["http://a/v1/chat/completions"]
+
+
+def test_responses_image_request_rejected_for_text_model_before_routing(monkeypatch):
+    monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
+    backend = Backend(backend_id="a", base_url="http://a", models=["mimo-v2.5-pro"])
+    backend.record_success()
+    transport = FakeTransport({
+        "http://a/v1/chat/completions": (200, _payload("mimo-v2.5-pro")),
+    })
+    handler = GatewayHandler(
+        router=Router(BackendRegistry([backend])),
+        transport=transport,
+    )
+    body = {
+        "model": "mimo-v2.5-pro",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is this?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        }],
+    }
+
+    with pytest.raises(BadRequestError):
+        asyncio.run(handler.handle(RequestContext(), OpenAIResponsesAdapter(), body))
+
+    assert transport.calls == []
+
+
+def test_anthropic_image_request_rejected_for_text_model_before_routing(monkeypatch):
+    monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
+    backend = Backend(backend_id="a", base_url="http://a", models=["mimo-v2.5-pro"])
+    backend.record_success()
+    transport = FakeTransport({
+        "http://a/anthropic/v1/messages": (200, b"{}"),
+    })
+    handler = GatewayHandler(
+        router=Router(BackendRegistry([backend])),
+        transport=transport,
+    )
+    body = {
+        "model": "mimo-v2.5-pro",
+        "max_tokens": 64,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "AAAA",
+                }},
+            ],
+        }],
+    }
+
+    with pytest.raises(BadRequestError) as exc:
+        asyncio.run(handler.handle(RequestContext(), AnthropicAdapter(), body))
+
+    assert exc.value.details["unsupported_input"] == "image"
+    assert transport.calls == []
+
+
+def test_anthropic_url_image_request_rejected_for_text_model_before_routing(monkeypatch):
+    monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
+    backend = Backend(backend_id="a", base_url="http://a", models=["mimo-v2.5-pro"])
+    backend.record_success()
+    transport = FakeTransport({
+        "http://a/anthropic/v1/messages": (200, b"{}"),
+    })
+    handler = GatewayHandler(
+        router=Router(BackendRegistry([backend])),
+        transport=transport,
+    )
+    body = {
+        "model": "mimo-v2.5-pro",
+        "max_tokens": 64,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image", "source": {
+                    "type": "url", "url": "https://example.com/image.png",
+                }},
+            ],
+        }],
+    }
+
+    with pytest.raises(BadRequestError) as exc:
+        asyncio.run(handler.handle(RequestContext(), AnthropicAdapter(), body))
+
+    assert exc.value.details["unsupported_input"] == "image"
+    assert transport.calls == []
