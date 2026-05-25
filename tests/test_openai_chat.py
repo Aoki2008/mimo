@@ -26,6 +26,7 @@ from gateway.adapters.openai_chat import (
     iter_sse_data,
 )
 from gateway.core import (
+    AudioDelta,
     BadRequestError,
     ContentBlockEnd,
     ContentBlockStart,
@@ -160,6 +161,20 @@ def test_parse_request_preserves_assistant_reasoning_content_with_tool_calls():
     assert msg.role == "assistant"
     assert msg.reasoning_content == "I should call the tool."
     assert msg.content[0].tool_id == "call_1"
+
+
+def test_parse_request_preserves_assistant_audio_payload():
+    req = _adapter().parse_request({
+        "model": "mimo-v2.5-tts",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+            "audio": {"data": "QUJD", "format": "wav"},
+        }],
+    })
+    msg = req.messages[0]
+    assert msg.role == "assistant"
+    assert msg.audio == {"data": "QUJD", "format": "wav"}
 
 
 def test_parse_request_missing_model_raises():
@@ -549,6 +564,26 @@ def test_parse_upstream_response_preserves_reasoning_content():
     assert any(isinstance(e, ReasoningDelta) and e.text == "thinking" for e in events)
 
 
+def test_parse_upstream_response_preserves_audio_payload():
+    payload = json.dumps({
+        "id": "chatcmpl-audio",
+        "model": "mimo-v2.5-tts",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "audio": {"data": "QUJD", "format": "wav"},
+            },
+            "finish_reason": "stop",
+        }],
+    }).encode()
+    events = _adapter().parse_upstream_response(payload, conversation_key="test-conv")
+    audio = next(e for e in events if isinstance(e, AudioDelta))
+    assert audio.data == "QUJD"
+    assert audio.format == "wav"
+
+
 # ───────── parse_upstream_stream ─────────
 
 
@@ -679,6 +714,30 @@ def test_parse_upstream_stream_preserves_reasoning_content_delta():
     assert "answer" == "".join(e.text for e in events if isinstance(e, TextDelta))
 
 
+def test_parse_upstream_stream_collects_audio_delta_payload():
+    chunks_payloads = [
+        {"id": "x1", "model": "mimo-v2.5-tts",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"audio": {"data": "QU", "format": "pcm16"}}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"audio": {"data": "JD"}}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
+
+    async def run():
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream]), conversation_key="test-conv"))
+
+    events = _run(run())
+    audio_deltas = [e for e in events if isinstance(e, AudioDelta)]
+    assert len(audio_deltas) == 2
+    assert audio_deltas[0].data == "QU"
+    assert audio_deltas[0].format == "pcm16"
+    assert audio_deltas[1].data == "JD"
+    assert audio_deltas[1].format == "pcm16"
+    end = events[-1]
+    assert isinstance(end, MessageEnd) and end.finish_reason == "stop"
+
+
 # ───────── serialize_response_stream (IES → OpenAI SSE) ─────────
 
 
@@ -730,6 +789,24 @@ def test_serialize_response_stream_emits_reasoning_content_delta():
         if c and c != b"data: [DONE]" and c.startswith(b"data: ")
     ]
     assert {"reasoning_content": "think"} in [p["choices"][0]["delta"] for p in payloads]
+
+
+def test_serialize_response_stream_emits_audio_delta_chunk():
+    async def feed() -> AsyncIterator[InternalEvent]:
+        yield MessageStart(message_id="x", model="mimo-v2.5-tts")
+        yield AudioDelta(data="QUJD", format="pcm16")
+        yield MessageEnd(finish_reason="stop", usage=Usage())
+
+    raw = _run(_drain(_adapter().serialize_response_stream(feed())))
+    payloads = [
+        json.loads(c[6:].decode())
+        for c in raw.split(b"\n\n")
+        if c and c != b"data: [DONE]" and c.startswith(b"data: ")
+    ]
+    assert payloads[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert payloads[1]["choices"][0]["delta"] == {
+        "audio": {"data": "QUJD", "format": "pcm16"},
+    }
 
 
 def test_serialize_response_stream_tool_call_delta():
@@ -797,6 +874,19 @@ def test_serialize_response_collects_reasoning_content():
     assert body["choices"][0]["message"]["reasoning_content"] == "hidden"
 
 
+def test_serialize_response_collects_audio_payload():
+    events: list[InternalEvent] = [
+        MessageStart(message_id="chatcmpl-a", model="mimo-v2.5-tts"),
+        AudioDelta(data="QU", format="wav"),
+        AudioDelta(data="JD"),
+        MessageEnd(finish_reason="stop", usage=Usage()),
+    ]
+    body = json.loads(_adapter().serialize_response(events).decode())
+    msg = body["choices"][0]["message"]
+    assert msg["audio"] == {"data": "QUJD", "format": "wav"}
+    assert msg["content"] is None
+
+
 def test_serialize_response_collects_tool_calls():
     events: list[InternalEvent] = [
         MessageStart(message_id="chatcmpl-2", model="m"),
@@ -828,6 +918,18 @@ def test_serialize_response_backfills_empty_assistant_content():
     assert msg["content"] == " "
     assert "tool_calls" not in msg
     assert "reasoning_content" not in msg
+
+
+def test_serialize_response_does_not_backfill_whitespace_when_audio_present():
+    events: list[InternalEvent] = [
+        MessageStart(message_id="chatcmpl-audio-only", model="mimo-v2.5-tts"),
+        AudioDelta(data="QUJD", format="wav"),
+        MessageEnd(finish_reason="stop", usage=Usage(input_tokens=1, output_tokens=0)),
+    ]
+    body = json.loads(_adapter().serialize_response(events).decode())
+    msg = body["choices"][0]["message"]
+    assert msg["audio"] == {"data": "QUJD", "format": "wav"}
+    assert msg["content"] is None
 
 
 # ───────── finish_reason mapping ─────────
@@ -1135,6 +1237,20 @@ def test_serialize_to_upstream_ignores_non_dict_thinking_metadata():
     })
     upstream = _adapter().serialize_to_upstream(body)
     assert "thinking" not in upstream
+
+
+def test_serialize_to_upstream_preserves_assistant_audio_payload():
+    req = _adapter().parse_request({
+        "model": "mimo-v2.5-tts",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+            "audio": {"data": "QUJD", "format": "wav"},
+        }],
+    })
+    upstream = _adapter().serialize_to_upstream(req)
+    assert upstream["messages"][0]["audio"] == {"data": "QUJD", "format": "wav"}
+    assert upstream["messages"][0]["content"] is None
 
 
 def test_reasoning_cache_commits_mid_stream_on_first_tool_id():
