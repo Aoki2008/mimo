@@ -5,13 +5,52 @@ This module keeps the bulky /v1 proxy, CORS, and public health endpoints out of
 """
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+import base64
+import json
 
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+
+from gateway.audio_speech import (
+    AudioSpeechRequest,
+    audio_media_type,
+    map_openai_tts_model,
+    map_openai_tts_voice,
+)
 from gateway.auth import authenticate_gateway_request
 from gateway.core import AuthError
 
-_GATEWAY_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"}
+_GATEWAY_PATHS = {"/v1/chat/completions", "/v1/audio/speech", "/v1/messages", "/v1/responses", "/v1/models"}
+
+
+def _translate_audio_speech_request(payload: AudioSpeechRequest) -> dict[str, object]:
+    input_text = payload.input.strip()
+    messages: list[dict[str, str]] = []
+    if isinstance(payload.instructions, str) and payload.instructions.strip():
+        messages.append({"role": "user", "content": payload.instructions})
+    messages.append({"role": "assistant", "content": input_text})
+    return {
+        "model": map_openai_tts_model(payload.model),
+        "messages": messages,
+        "audio": {
+            "format": payload.response_format.lower(),
+            "voice": map_openai_tts_voice(payload.voice),
+        },
+        "stream": False,
+    }
+
+
+def _extract_audio_response_bytes(resp_json: dict, *, fallback_format: str) -> tuple[bytes, str]:
+    audio = (((resp_json.get("choices") or [{}])[0].get("message") or {}).get("audio") or {})
+    audio_b64 = audio.get("data") if isinstance(audio, dict) else None
+    audio_format = audio.get("format") if isinstance(audio, dict) else None
+    if not isinstance(audio_b64, str) or not audio_b64:
+        raise ValueError("上游 TTS 响应里没有音频数据")
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError("上游 TTS 音频数据损坏") from e
+    return audio_bytes, (audio_format or fallback_format).lower()
 
 
 def register_gateway_routes(app: FastAPI, *, auth_cookie: str) -> None:
@@ -50,16 +89,48 @@ def register_gateway_routes(app: FastAPI, *, auth_cookie: str) -> None:
         if full_path not in _GATEWAY_PATHS:
             return JSONResponse({"error": {"message": f"Unknown path: {full_path}"}}, status_code=404)
 
-        adapter_name = "openai_chat"
-        if full_path == "/v1/messages":
-            adapter_name = "anthropic"
-        elif full_path == "/v1/responses":
-            adapter_name = "openai_responses"
-
         try:
             principal = await authenticate_gateway_request(request, auth_cookie=auth_cookie)
             request.state.gateway_principal = principal
+
+            if full_path == "/v1/audio/speech":
+                if request.method != "POST":
+                    return JSONResponse({"error": {"message": "Method not allowed"}}, status_code=405)
+                try:
+                    raw_body = await request.body()
+                    payload = AudioSpeechRequest.model_validate_json(raw_body)
+                except Exception as e:
+                    return JSONResponse({"error": {"message": f"Invalid request body: {e}"}}, status_code=400)
+
+                input_text = payload.input.strip()
+                if not input_text:
+                    return JSONResponse({"error": {"message": "`input` 不能为空"}}, status_code=400)
+
+                from gateway.runtime import dispatch_with_body_override
+                translated = _translate_audio_speech_request(payload)
+                upstream_resp = await dispatch_with_body_override("openai_chat", request, translated)
+                if upstream_resp.status_code >= 400:
+                    return upstream_resp
+                try:
+                    resp_json = json.loads(upstream_resp.body)
+                except Exception:
+                    return JSONResponse({"error": {"message": "上游 TTS 返回了非法 JSON"}}, status_code=502)
+                try:
+                    audio_bytes, audio_format = _extract_audio_response_bytes(
+                        resp_json,
+                        fallback_format=payload.response_format,
+                    )
+                except ValueError as e:
+                    return JSONResponse({"error": {"message": str(e)}}, status_code=502)
+                return Response(audio_bytes, media_type=audio_media_type(audio_format))
+
             from gateway.runtime import dispatch
+            adapter_name = "openai_chat"
+            if full_path == "/v1/messages":
+                adapter_name = "anthropic"
+            elif full_path == "/v1/responses":
+                adapter_name = "openai_responses"
+
             return await dispatch(adapter_name, request)
         except AuthError as e:
             return JSONResponse(

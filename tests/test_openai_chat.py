@@ -1,4 +1,4 @@
-"""Unit tests for gateway.adapters.openai_chat.
+"""Unit tests for gateway.adapters.openai_chat and gateway.routes TTS helpers.
 
 Covered:
   * iter_sse_data — chunk boundary, keepalive, tail flush
@@ -10,10 +10,12 @@ Covered:
   * serialize_response — non-stream collected JSON
   * finish_reason mapping — function_call → tool_calls
   * error_envelope — OpenAI {error:{message,type,code}} shape
+  * /v1/audio/speech helper translation / extraction
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import AsyncIterator
 
@@ -25,6 +27,7 @@ from gateway.adapters.openai_chat import (
     _map_finish,
     iter_sse_data,
 )
+from gateway.audio_speech import AudioSpeechRequest
 from gateway.core import (
     AudioDelta,
     BadRequestError,
@@ -42,6 +45,7 @@ from gateway.core import (
     ToolCallDelta,
     Usage,
 )
+from gateway.routes import _extract_audio_response_bytes, _translate_audio_speech_request
 
 
 # ───────── helpers ─────────
@@ -967,6 +971,65 @@ def test_finish_reason_legacy_function_call_maps_to_tool_calls():
 
 def test_finish_reason_ies_to_openai_error_demotes_to_stop():
     assert _IES_TO_OPENAI_FINISH["error"] == "stop"
+
+
+# ───────── /v1/audio/speech helpers ─────────
+
+
+def test_translate_audio_speech_request_builds_chat_payload():
+    payload = AudioSpeechRequest(
+        input="你好，世界",
+        model="tts-1",
+        voice="alloy",
+        response_format="wav",
+        instructions="用开心一点的语气",
+    )
+    translated = _translate_audio_speech_request(payload)
+    assert translated == {
+        "model": "mimo-v2.5-tts",
+        "messages": [
+            {"role": "user", "content": "用开心一点的语气"},
+            {"role": "assistant", "content": "你好，世界"},
+        ],
+        "audio": {"format": "wav", "voice": "mimo_default"},
+        "stream": False,
+    }
+
+
+def test_extract_audio_response_bytes_reads_message_audio():
+    payload = {
+        "choices": [{
+            "message": {
+                "audio": {
+                    "data": base64.b64encode(b"abc").decode(),
+                    "format": "mp3",
+                }
+            }
+        }]
+    }
+    audio_bytes, audio_format = _extract_audio_response_bytes(payload, fallback_format="wav")
+    assert audio_bytes == b"abc"
+    assert audio_format == "mp3"
+
+
+def test_extract_audio_response_bytes_uses_fallback_format_when_missing():
+    payload = {
+        "choices": [{
+            "message": {
+                "audio": {
+                    "data": base64.b64encode(b"xyz").decode(),
+                }
+            }
+        }]
+    }
+    audio_bytes, audio_format = _extract_audio_response_bytes(payload, fallback_format="wav")
+    assert audio_bytes == b"xyz"
+    assert audio_format == "wav"
+
+
+def test_extract_audio_response_bytes_raises_when_audio_missing():
+    with pytest.raises(ValueError, match="没有音频数据"):
+        _extract_audio_response_bytes({"choices": [{"message": {}}]}, fallback_format="wav")
 
 
 # ───────── error_envelope ─────────
