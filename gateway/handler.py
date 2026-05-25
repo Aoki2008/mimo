@@ -51,6 +51,10 @@ from gateway.core import (
     RequestContext,
     UpstreamError,
 )
+from gateway.model_capabilities import (
+    validate_anthropic_body_capabilities,
+    validate_request_capabilities,
+)
 from gateway.routing import Router
 from gateway.transport import UpstreamTransport
 
@@ -158,6 +162,7 @@ class GatewayHandler:
             # Rewrite so the upstream sees the native name, not the client-facing alias.
             req.model = native
             ctx.model = native
+        validate_request_capabilities(req)
 
         upstream_body = self._codec.serialize_to_upstream(req)
         # Conversation-scope key derived from this request's full message
@@ -228,6 +233,10 @@ class GatewayHandler:
         if native != requested_model:
             body["model"] = native
             ctx.model = native
+
+        parsed_for_capabilities = adapter.parse_request(body)
+        validate_request_capabilities(parsed_for_capabilities)
+        validate_anthropic_body_capabilities(native, body)
 
         # Rehydrate missing thinking blocks before sending to upstream.
         # patch_request_thinking computes its own per-assistant-message
@@ -336,6 +345,7 @@ class GatewayHandler:
                 self._record_metric(ctx, backend.backend_id, status,
                                     (time.monotonic() - started) * 1000,
                                     error=f"http {status}")
+                _raise_client_payload_error_if_applicable(status, raw)
                 raise UpstreamError(
                     f"Upstream returned {status}: {raw[:200]!r}",
                     details={"status": status},
@@ -416,15 +426,17 @@ class GatewayHandler:
 
         ctx.upstream_status = status
         if status >= 400:
+            raw_error = bytearray()
             try:
-                async for _ in raw_iter:
-                    pass
+                async for chunk in raw_iter:
+                    raw_error.extend(chunk)
             except Exception:
                 pass
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, status,
                                 (time.monotonic() - started) * 1000,
                                 error=f"http {status}")
+            _raise_client_payload_error_if_applicable(status, bytes(raw_error))
             raise UpstreamError(
                 f"Upstream returned {status}",
                 details={"status": status},
@@ -571,6 +583,7 @@ class GatewayHandler:
                 self._record_metric(ctx, backend.backend_id, status,
                                     (time.monotonic() - started) * 1000,
                                     error=f"http {status}")
+                _raise_client_payload_error_if_applicable(status, raw)
                 raise UpstreamError(
                     f"Upstream returned {status}: {raw[:200]!r}",
                     details={"status": status},
@@ -668,15 +681,17 @@ class GatewayHandler:
 
         ctx.upstream_status = status
         if status >= 400:
+            raw_error = bytearray()
             try:
-                async for _ in raw_iter:
-                    pass
+                async for chunk in raw_iter:
+                    raw_error.extend(chunk)
             except Exception:
                 pass
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, status,
                                 (time.monotonic() - started) * 1000,
                                 error=f"http {status}")
+            _raise_client_payload_error_if_applicable(status, bytes(raw_error))
             raise UpstreamError(
                 f"Upstream returned {status}",
                 details={"status": status},
@@ -758,6 +773,42 @@ def _content_type_for(adapter: ProtocolAdapter, *, stream: bool) -> str:
     if adapter.name == "anthropic":
         return "application/json"
     return "application/json"
+
+
+def _raise_client_payload_error_if_applicable(status: int, raw: bytes) -> None:
+    """Turn upstream 400 payload/schema rejections into clearer client errors."""
+    if status != 400:
+        return
+    upstream = _parse_upstream_error(raw)
+    raise BadRequestError(
+        "客户端请求体参数不符合 MiMo API 要求",
+        details={
+            "upstream_status": status,
+            "upstream_error": upstream,
+        },
+    )
+
+
+def _parse_upstream_error(raw: bytes) -> dict[str, str]:
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError):
+        text = raw.decode("utf-8", errors="replace").strip()
+        return {"message": text[:500] if text else "Param Incorrect"}
+    if not isinstance(data, dict):
+        return {"message": "Param Incorrect"}
+    err = data.get("error")
+    if isinstance(err, dict):
+        return {
+            str(k): str(v)
+            for k, v in err.items()
+            if k in {"code", "message", "param", "type"} and v is not None
+        }
+    return {
+        str(k): str(v)
+        for k, v in data.items()
+        if k in {"code", "message", "param", "type"} and v is not None
+    }
 
 
 def _extract_token_counts(events) -> tuple[int, int]:
