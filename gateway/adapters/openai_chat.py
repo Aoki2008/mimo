@@ -102,6 +102,8 @@ def _canonical_message_bytes(m: InternalMessage) -> bytes:
             blocks.append({"t": "image", "mime": c.image_mime or "", "d": c.image_data or ""})
         # NOTE: "thinking" blocks deliberately omitted — see docstring.
     payload = {"role": m.role, "content": blocks}
+    if m.audio is not None:
+        payload["audio"] = m.audio
     return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 

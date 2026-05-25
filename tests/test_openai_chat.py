@@ -177,6 +177,27 @@ def test_parse_request_preserves_assistant_audio_payload():
     assert msg.audio == {"data": "QUJD", "format": "wav"}
 
 
+def test_conversation_key_hash_includes_assistant_audio_payload():
+    audio_req = _adapter().parse_request({
+        "model": "mimo-v2.5-tts",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+            "audio": {"data": "QUJD", "format": "wav"},
+        }],
+    })
+    no_audio_req = _adapter().parse_request({
+        "model": "mimo-v2.5-tts",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+        }],
+    })
+    assert _adapter().serialize_to_upstream(audio_req)["messages"][0]["audio"] == {"data": "QUJD", "format": "wav"}
+    from gateway.adapters.openai_chat import _conversation_key_for_request
+    assert _conversation_key_for_request(audio_req.messages) != _conversation_key_for_request(no_audio_req.messages)
+
+
 def test_parse_request_missing_model_raises():
     with pytest.raises(BadRequestError):
         _adapter().parse_request({"messages": [{"role": "user", "content": "x"}]})
