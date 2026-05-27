@@ -1146,7 +1146,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         log.log("端口再次清理完成" if rc2 == 0 else f"再次清理: {stderr2 or '无残留'}")
 
         log.log("Step 6: 通知 Claw 公钥已添加...")
-        notify_msg = "公钥已就位，可以建立反向隧道了。"
+        notify_msg = "密钥已添加完成，请执行后续连接操作。"
         reply6, err6 = None, None
         for attempt in range(1, 4):
             reply6, err6 = await claw_ws_chat(
