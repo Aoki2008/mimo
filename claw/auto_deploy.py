@@ -6,6 +6,7 @@ Flow per account:
   0.5. Clean up stale tunnel processes on jump server
   1. Create new claw
   2. Wait until claw is AVAILABLE
+  2.5. Reset AGENTS.md/SOUL.md from templates and restart via Claw
   3. Send deploy text → claw executes (multi-step in claw)
   4. Capture SSH public key from claw reply
   5. Add SSH key to jump server's authorized_keys
@@ -159,6 +160,8 @@ _PROBE_API_CHAT_THINKING_BUDGET = int(os.environ.get("MIMO_DEPLOY_CHAT_PROBE_THI
 _PROBE_API_CHAT_MAX_ITERS = int(os.environ.get("MIMO_DEPLOY_CHAT_PROBE_MAX_ITERS", "3"))
 _PROXY_AUTH_TOKEN = os.environ.get("MIMO_PROXY_AUTH_TOKEN", "sk-Aoki-MiMo")
 _CLAW_BOOTSTRAP_SESSION_MAX_ATTEMPTS = 3
+_CLAW_TEMPLATE_RESET_MESSAGE = "把 AGENTS.md 和 SOUL.md 切回模板.并重启"
+_CLAW_TEMPLATE_RESET_MAX_ATTEMPTS = 2
 _STEP7_MAX_ATTEMPTS = 3
 
 
@@ -170,6 +173,16 @@ def _is_retryable_create_429(data: object) -> bool:
     tied to the structured 429 code rather than the localized message text.
     """
     return isinstance(data, dict) and data.get("code") == 429
+
+
+def _is_claw_template_reset_reply_success(reply: str) -> bool:
+    normalized = (reply or "").strip()
+    if not normalized:
+        return False
+    has_targets = "AGENTS.md" in normalized and "SOUL.md" in normalized
+    has_reset_signal = any(word in normalized for word in ("模板", "恢复", "切回"))
+    has_restart_signal = any(word in normalized for word in ("重启", "restart", "restarted"))
+    return has_targets and has_reset_signal and has_restart_signal
 
 
 # In-memory log size cap; on-disk log is rotated past this many bytes.
@@ -1052,6 +1065,42 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             mark_finished("error", history_status="error")
             return
         log.log("✅ Claw 就绪")
+
+        # Step 2.5: ensure a fresh Claw starts from the expected templates
+        # before we hand it the deployment prompt.
+        set_state("step2_template_reset")
+        log.log("Step 2.5: 发送模板恢复/重启测试到 Claw...")
+        reset_ok = False
+        reset_reply = ""
+        for attempt in range(1, _CLAW_TEMPLATE_RESET_MAX_ATTEMPTS + 1):
+            reset_session_key = f"agent:main:reset-{account_filename}-{uuid.uuid4().hex[:8]}"
+            reset_reply, reset_err = await claw_ws_chat(
+                _CLAW_TEMPLATE_RESET_MESSAGE,
+                reset_session_key,
+                cookies=cookies,
+            )
+            if reset_err:
+                log.log(
+                    f"⚠️ 模板恢复测试第 {attempt}/{_CLAW_TEMPLATE_RESET_MAX_ATTEMPTS} 次通信失败: {reset_err}"
+                )
+            else:
+                log.log(f"模板恢复测试 Claw 回复: {_fmt_claw_reply(reset_reply or '')}")
+                if _is_claw_template_reset_reply_success(reset_reply or ""):
+                    reset_ok = True
+                    break
+                log.log(
+                    f"⚠️ 模板恢复测试第 {attempt}/{_CLAW_TEMPLATE_RESET_MAX_ATTEMPTS} 次回复未确认完成"
+                )
+            if attempt < _CLAW_TEMPLATE_RESET_MAX_ATTEMPTS:
+                await asyncio.sleep(3 * attempt)
+        if cancelled():
+            mark_finished("cancelled", history_status="cancelled")
+            return
+        if not reset_ok:
+            log.log("❌ 模板恢复/重启测试未通过，停止部署")
+            mark_finished("error", history_status="error")
+            return
+        log.log("✅ 模板恢复/重启测试通过")
 
         if not deploy_text:
             log.log("❌ 未配置部署文案，请在面板中填写")
