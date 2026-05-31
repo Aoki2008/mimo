@@ -1887,6 +1887,16 @@ async def claw_worker_regen(worker_id: str):
         {"error": "worker 不存在"}, status_code=404)
 
 
+@app.post("/api/claw-worker/trigger/{account_filename}")
+async def claw_worker_trigger(account_filename: str):
+    """Queue an immediate worker deploy for an account (bypasses cron). Picked
+    up on the next worker poll."""
+    from gateway.claw_worker_registry import force_deploy
+    ok = force_deploy(account_filename)
+    return {"success": ok} if ok else JSONResponse(
+        {"success": False, "error": "账号不存在"}, status_code=404)
+
+
 @app.post("/api/claw-worker/sync")
 async def claw_worker_sync(request: Request):
     """Worker data channel. Auth via X-Worker-Token. phase = poll|claw_ready|

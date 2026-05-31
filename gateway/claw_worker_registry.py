@@ -28,11 +28,13 @@ from pathlib import Path
 DATA_PATH = Path(__file__).parent.parent / "data" / "claw_workers.json"
 OFFLINE_AFTER_S = 180          # 3x the default 60s poll interval
 JOB_STALE_AFTER_S = 30 * 60    # reclaim accounts whose worker died mid-job
+WORKER_FIRE_WINDOW_S = 180     # only fire within this window after a cron boundary
 DEFAULT_NOTIFY = "密钥已添加完成，请执行后续连接操作。"
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}        # job_id -> {account, worker_id, ssh_port, api_port, logger, status, started}
 _inflight: dict[str, str] = {}     # account -> job_id
+_force: set[str] = set()           # accounts queued for an immediate (manual) deploy
 
 
 def _ad():
@@ -150,40 +152,70 @@ def _reap_stale():
 
 
 def _due_worker_accounts(cfg: dict) -> list[str]:
+    """Cron-due accounts, matching the local scheduler's semantics: only fire
+    within WORKER_FIRE_WINDOW_S after a cron boundary (no catch-up / no
+    fire-on-enable), and not again for the same boundary."""
     from croniter import croniter
-    now = time.time()
+    now_dt = datetime.now()
     out = []
     for acc, c in cfg.get("accounts", {}).items():
         if not c.get("worker_deploy"):
             continue
-        if acc in _inflight:
+        if acc in _inflight or acc in _force:
             continue
         cron_expr = c.get("worker_cron") or c.get("cron") or "0 3 * * *"
-        last = c.get("worker_last_run", 0)
+        last = c.get("worker_last_run", 0) or 0
         try:
-            base = datetime.fromtimestamp(last) if last else datetime.fromtimestamp(now - 86400)
-            nxt = croniter(cron_expr, base).get_next(float)
-        except (ValueError, KeyError, OSError):
+            prev_fire = croniter(cron_expr, now_dt).get_prev(datetime)
+        except (ValueError, KeyError):
             continue
-        if nxt <= now:
-            out.append(acc)
+        diff = (now_dt - prev_fire).total_seconds()
+        if not (0 <= diff <= WORKER_FIRE_WINDOW_S):
+            continue
+        if last >= prev_fire.timestamp():
+            continue
+        out.append(acc)
     return out
 
 
+def force_deploy(account: str) -> bool:
+    """Queue an immediate (manual) deploy, bypassing cron. Picked up on the
+    next worker poll."""
+    cfg = _ad().load_config()
+    if account not in cfg.get("accounts", {}):
+        return False
+    with _lock:
+        _force.add(account)
+    return True
+
+
 def claim_job(worker_id: str) -> dict | None:
-    """Pick a due worker-managed account, mark in-flight, build a job."""
+    """Pick a forced or cron-due worker-managed account, mark in-flight + mark
+    the cron boundary fired (worker_last_run=now), build a job."""
     ad = _ad()
     with _lock:
         _reap_stale()
         cfg = ad.load_config()
-        due = _due_worker_accounts(cfg)
-        if not due:
+        acc = None
+        for f in list(_force):
+            if f in cfg.get("accounts", {}) and f not in _inflight:
+                acc = f
+                _force.discard(f)
+                break
+        if acc is None:
+            due = _due_worker_accounts(cfg)
+            acc = due[0] if due else None
+        if acc is None:
             return None
-        acc = due[0]
         acc_cfg = cfg["accounts"][acc]
         cookies = ad._load_account_cookies(acc)
         if not cookies:
             return None
+        # Mark this cron boundary as fired NOW (before dispatch) so polls during
+        # the deploy — and after a failure — don't re-fire it (matches the local
+        # scheduler, which sets last_run before triggering).
+        cfg["accounts"][acc]["worker_last_run"] = time.time()
+        ad.save_config(cfg)
         job_id = uuid.uuid4().hex[:12]
         ssh_port = acc_cfg.get("ssh_port", 8022)
         api_port = acc_cfg.get("api_port", 8800)
@@ -258,11 +290,6 @@ def on_report(job_id: str, status: str, worker_log: str = "") -> None:
             break
     try:
         ad._save_run_history(job["account"], hist_status, log.lines[:])
-        if status == "done":
-            cfg = ad.load_config()
-            if job["account"] in cfg.get("accounts", {}):
-                cfg["accounts"][job["account"]]["worker_last_run"] = time.time()
-                ad.save_config(cfg)
     except Exception:
         pass
     _record_recent(job["account"], status, job["worker_id"], job_id, summary)

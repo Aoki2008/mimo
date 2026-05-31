@@ -696,7 +696,7 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
           勾选后该账号的部署由 Worker 在大陆执行(独立于本地调度的"启用"开关),按 Worker Cron 触发。
         </div>
         <table class="data-table">
-          <thead><tr><th>账号</th><th>Worker 托管</th><th>Worker Cron</th><th>上次 Worker 部署</th></tr></thead>
+          <thead><tr><th>账号</th><th>Worker 托管</th><th>Worker Cron</th><th>上次 Worker 部署</th><th>操作</th></tr></thead>
           <tbody id="cwAccountsBody"></tbody>
         </table>
       </div>
@@ -2299,6 +2299,7 @@ function refreshClawWorkers() {
           '<td><input type="text" value="' + escapeHtml(cron) + '" style="width:120px;padding:4px;background:#0d1b2a;border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:0.8rem" ' +
               'onchange="cwSetCron(\'' + escapeHtml(accJs) + '\',this.value)"></td>' +
           '<td style="font-size:0.8rem;color:var(--text3)">' + lastWr + '</td>' +
+          '<td><button class="icon-btn" onclick="cwTriggerNow(\'' + escapeHtml(accJs) + '\')">立即部署</button></td>' +
           '</tr>';
       });
     }
@@ -2360,6 +2361,14 @@ function cwSetCron(acc, cron) {
   }).catch(function() { toast('保存失败', 'error'); });
 }
 
+function cwTriggerNow(acc) {
+  if (!confirm('立即用 Worker 部署 ' + acc + '？(忽略 cron,下次轮询即执行)')) return;
+  api('POST', '/api/claw-worker/trigger/' + encodeURIComponent(acc)).then(function(d) {
+    if (d.success) { toast('已排入队列,Worker 下次轮询执行', 'success'); }
+    else { toast(d.error || '失败', 'error'); }
+  }).catch(function() { toast('触发失败', 'error'); });
+}
+
 window.refreshClawWorkers = refreshClawWorkers;
 window.cwToggleAdd = cwToggleAdd;
 window.cwAddWorker = cwAddWorker;
@@ -2368,6 +2377,7 @@ window.cwRegen = cwRegen;
 window.cwDelete = cwDelete;
 window.cwToggleAccount = cwToggleAccount;
 window.cwSetCron = cwSetCron;
+window.cwTriggerNow = cwTriggerNow;
 
 // ══════════════════════════════════════════════════════
 // Clock & Init
