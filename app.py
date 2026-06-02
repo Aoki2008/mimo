@@ -42,7 +42,9 @@ logger = logging.getLogger(__name__)
 from gateway.secrets_store import secrets as _secrets
 
 AUTH_COOKIE = "mimo_panel_auth"
-AUTH_TOKEN = _secrets.public_api_token
+# Panel session token is SEPARATE from the public API token, so a leaked API
+# token (handed to /v1 clients) can't be replayed as an admin session cookie.
+AUTH_TOKEN = _secrets.panel_session_token
 PANEL_PASSWORD = _secrets.panel_password
 
 
@@ -107,6 +109,14 @@ async def error_logging_middleware(request: Request, call_next):
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
+    # IP allowlist gates the PANEL/admin surface only. Public + token-authed
+    # endpoints (API, worker, probe, stats, health) stay reachable from anywhere
+    # so /v1 clients, the claw-worker and probes still work. Empty list = no gate.
+    if not _is_public_path(path):
+        from gateway.panel_acl import is_allowed
+        if not is_allowed(_client_ip(request)):
+            _audit("ip_blocked", request)
+            return JSONResponse({"error": "forbidden"}, status_code=403)
     if path in ("/login", "/do_login") or path.startswith("/static"):
         return await call_next(request)
     # Gateway API routes handle their own auth (Bearer token)
@@ -216,6 +226,17 @@ def _account_filename(name):
 
 # Cache the resolved accounts dir so each request doesn't re-stat the FS.
 _ACCOUNTS_DIR_RESOLVED: Path | None = None
+
+
+def _is_public_path(path: str) -> bool:
+    """Paths reachable from ANY ip (not gated by the panel IP allowlist):
+    the public API, token-authed worker/probe channels, stats and health."""
+    if path.startswith(("/v1/", "/static", "/probe/")):
+        return True
+    return path in (
+        "/health", "/gateway/status", "/stats", "/api/public/stats",
+        "/api/probe/report", "/api/claw-worker/sync", "/ws",
+    )
 
 
 def _is_safe_account_filename(filename: str) -> bool:
@@ -1897,6 +1918,32 @@ async def claw_worker_trigger(account_filename: str):
         {"success": False, "error": "账号不存在"}, status_code=404)
 
 
+# ──────────── Panel access control (IP allowlist) ────────────
+
+@app.get("/api/panel-acl")
+async def panel_acl_get(request: Request):
+    """Current allowlist + the caller's IP (so the UI can show 'add my IP')."""
+    from gateway.panel_acl import list_allowed
+    return {"allowed_ips": list_allowed(), "your_ip": _client_ip(request)}
+
+
+@app.post("/api/panel-acl")
+async def panel_acl_set(request: Request):
+    """Body: {allowed_ips:[...]}. Refuses a non-empty list that excludes the
+    caller's own IP (anti-lockout)."""
+    from gateway import panel_acl
+    body = await request.json()
+    clean = panel_acl.validate(body.get("allowed_ips") or [])
+    ip = _client_ip(request)
+    if clean and not panel_acl.matches(ip, clean):
+        return JSONResponse(
+            {"error": f"列表不含你当前 IP ({ip})，会把自己锁在外面，已拒绝。"},
+            status_code=400)
+    saved = panel_acl.set_allowed(clean)
+    _audit("panel_acl_set", request, count=len(saved))
+    return {"allowed_ips": saved}
+
+
 @app.post("/api/claw-worker/sync")
 async def claw_worker_sync(request: Request):
     """Worker data channel. Auth via X-Worker-Token. phase = poll|claw_ready|
@@ -2060,8 +2107,10 @@ async def public_stats_page():
 # ──────────── Gateway Proxy Routes ────────────
 
 from gateway.routes import register_gateway_routes
+from gateway.ws_tunnel import register_ws_routes
 
 register_gateway_routes(app, auth_cookie=AUTH_COOKIE)
+register_ws_routes(app)
 
 
 if __name__ == "__main__":

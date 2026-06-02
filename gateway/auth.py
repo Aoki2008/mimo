@@ -68,7 +68,7 @@ async def authenticate_gateway_request(
     ``Authorization: Bearer``. We accept all three so the gateway looks like
     whatever protocol the caller expects.
     """
-    if request.cookies.get(auth_cookie) == secrets.public_api_token:
+    if request.cookies.get(auth_cookie) == secrets.panel_session_token:
         return GatewayPrincipal(key_id="panel", source="panel_cookie")
 
     token = _extract_token(request)

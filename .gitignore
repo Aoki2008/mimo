@@ -68,3 +68,4 @@ logs/
 verification.md
 .codex/
 deploy_logs/
+tmp/

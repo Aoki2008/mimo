@@ -26,6 +26,7 @@ class Secrets:
     panel_password: str = ""
     public_api_token: str = ""
     upstream_api_key: str = ""
+    panel_session_token: str = ""
 
 
 def _generate_defaults() -> dict[str, str]:
@@ -33,6 +34,9 @@ def _generate_defaults() -> dict[str, str]:
         "panel_password": "Aoki-MiMo",
         "public_api_token": f"sk-mimo-{_secrets_mod.token_urlsafe(32)}",
         "upstream_api_key": "",
+        # Panel session cookie value — MUST be separate from the API token so a
+        # leaked API token can't be replayed as an admin session cookie.
+        "panel_session_token": _secrets_mod.token_urlsafe(32),
     }
 
 
@@ -62,6 +66,7 @@ def _load() -> Secrets:
         "MIMO_PANEL_PASSWORD": "panel_password",
         "MIMO_PUBLIC_API_TOKEN": "public_api_token",
         "MIMO_UPSTREAM_API_KEY": "upstream_api_key",
+        "MIMO_PANEL_SESSION_TOKEN": "panel_session_token",
     }
     for env_key, field_name in env_map.items():
         val = os.environ.get(env_key)

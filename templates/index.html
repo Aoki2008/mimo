@@ -231,6 +231,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     <div class="nav-item" data-page="logs" onclick="switchPage('logs')">
       <span class="icon">🧾</span><span>系统日志</span>
     </div>
+    <div class="nav-item" data-page="panel-acl" onclick="switchPage('panel-acl')">
+      <span class="icon">🔒</span><span>访问控制</span>
+    </div>
   </div>
 
   <div class="nav-sep"></div>
@@ -736,6 +739,28 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       </div>
     </div>
 
+    <!-- ════ Panel access control ════ -->
+    <div class="page" id="page-panel-acl">
+      <div class="section">
+        <h2>🔒 面板访问控制</h2>
+        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
+          <p>仅限列表内的 IP 访问管理面板。公开 API（<code>/v1/*</code>）、worker、探针等端点不受此限制。</p>
+          <p style="margin-top:6px">你当前的 IP：<strong id="aclYourIp" style="color:var(--text)">--</strong>
+            <button class="btn btn-ghost" style="padding:3px 10px;margin-left:8px" onclick="aclAddMyIp()">加入我的 IP</button>
+          </p>
+          <p style="margin-top:6px;color:var(--yellow)">⚠️ 留空 = 不限制（任意 IP 可访问）。保存非空列表时，若不含你当前 IP 会被拒绝，避免把自己锁在外面。</p>
+        </div>
+      </div>
+      <div class="section">
+        <h2>白名单（每行一个 IP 或 CIDR）</h2>
+        <textarea id="aclTextarea" rows="8" placeholder="例如：&#10;203.0.113.5&#10;198.51.100.0/24" style="min-height:160px;font-family:monospace"></textarea>
+        <div class="btn-group">
+          <button class="btn btn-primary" id="aclSaveBtn" onclick="savePanelAcl()">保存</button>
+          <button class="btn btn-ghost" onclick="refreshPanelAcl()">重新加载</button>
+        </div>
+      </div>
+    </div>
+
   </div><!-- /content -->
 </div><!-- /main -->
 
@@ -792,7 +817,7 @@ var PAGE_TITLES = {
   gateway: '网关状态', backends: '后端服务器',
   mappings: '模型映射',
   metrics: '指标与日志',
-  vps: 'VPS 监控', 'api-docs': 'API 文档'
+  vps: 'VPS 监控', 'api-docs': 'API 文档', 'panel-acl': '访问控制'
 };
 
 function switchPage(name) {
@@ -818,6 +843,7 @@ function switchPage(name) {
   if (name === 'metrics') refreshMetrics();
   if (name === 'vps') refreshVps();
   if (name === 'claw-workers') refreshClawWorkers();
+  if (name === 'panel-acl') refreshPanelAcl();
 }
 
 function pageFromHash() {
@@ -1386,10 +1412,6 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     html += '<div style="display:grid;grid-template-columns:1fr 2fr;gap:10px;margin-bottom:10px">';
     html += '<div><label style="font-size:0.78rem;color:var(--text3)">启用</label><br><input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="updateAccountDeploy(\'' + fn + '\',\'enabled\',this.checked)" style="width:auto;margin-top:4px"></div>';
     html += '<div><label style="font-size:0.78rem;color:var(--text3)">Cron 表达式</label><input type="text" value="' + cron + '" onchange="updateAccountDeploy(\'' + fn + '\',\'cron\',this.value)" oninput="this.dataset.dirty=1" onblur="if(this.dataset.dirty){updateAccountDeploy(\'' + fn + '\',\'cron\',this.value);this.dataset.dirty=0}" style="margin-top:4px;font-family:monospace"></div>';
-    html += '</div>';
-    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">';
-    html += '<div><label style="font-size:0.78rem;color:var(--text3)">SSH 端口</label><input type="number" value="' + (cfg.ssh_port || 8022) + '" onchange="updateAccountDeploy(\'' + fn + '\',\'ssh_port\',parseInt(this.value))" style="margin-top:4px;font-family:monospace"></div>';
-    html += '<div><label style="font-size:0.78rem;color:var(--text3)">API 端口</label><input type="number" value="' + (cfg.api_port || 8800) + '" onchange="updateAccountDeploy(\'' + fn + '\',\'api_port\',parseInt(this.value))" style="margin-top:4px;font-family:monospace"></div>';
     html += '</div>';
     var schedInfo = (scheduler.accounts && scheduler.accounts[fn]) || {};
     var lastRun = schedInfo.last_run || (cfg.last_run ? new Date(cfg.last_run * 1000).toLocaleString('zh-CN') : '从未');
@@ -2307,6 +2329,39 @@ function refreshClawWorkers() {
   }).catch(function() {
     document.getElementById('cwSummary').textContent = '加载失败';
   });
+}
+
+// ── Panel access control (IP allowlist) ──
+var _aclYourIp = '';
+function refreshPanelAcl() {
+  api('GET', '/api/panel-acl').then(function(d) {
+    _aclYourIp = d.your_ip || '';
+    document.getElementById('aclYourIp').textContent = _aclYourIp || '未知';
+    document.getElementById('aclTextarea').value = (d.allowed_ips || []).join('\n');
+  }).catch(function() { toast('加载访问控制失败', 'error'); });
+}
+
+function aclAddMyIp() {
+  if (!_aclYourIp) { toast('未知当前 IP', 'error'); return; }
+  var ta = document.getElementById('aclTextarea');
+  var ips = ta.value.split('\n').map(function(s){return s.trim();}).filter(Boolean);
+  if (ips.indexOf(_aclYourIp) === -1) ips.push(_aclYourIp);
+  ta.value = ips.join('\n');
+}
+
+function savePanelAcl() {
+  var ips = document.getElementById('aclTextarea').value
+    .split('\n').map(function(s){return s.trim();}).filter(Boolean);
+  if (ips.length === 0 &&
+      !confirm('白名单为空 = 不限制任何 IP，确定保存？')) return;
+  var btn = document.getElementById('aclSaveBtn');
+  btn.disabled = true;
+  api('POST', '/api/panel-acl', {allowed_ips: ips}).then(function(d) {
+    btn.disabled = false;
+    if (d.error) { toast(d.error, 'error'); return; }
+    document.getElementById('aclTextarea').value = (d.allowed_ips || []).join('\n');
+    toast('访问控制已保存', 'success');
+  }).catch(function() { btn.disabled = false; toast('保存失败', 'error'); });
 }
 
 function cwToggleAdd() {
