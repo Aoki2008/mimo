@@ -144,7 +144,7 @@ _ROTATION_HARD_EXPIRY_AGE_S = 55 * 60
 _DESTROY_POLL_INTERVAL_S = 5
 _DESTROY_POLL_MAX_ITERS = 12  # → up to 60s wait
 _CREATE_POLL_INTERVAL_S = 5
-_CREATE_POLL_MAX_ITERS = 60   # → up to 300s wait (Claw cold-start can hit 80-150s)
+_CREATE_POLL_MAX_ITERS = 144  # → up to 720s wait (mainland edge cold-start can exceed 300s)
 # 429 "Mimo Claw使用中机器已达上限" 重试预算与节奏。MiMo 的 claw 池子在高峰
 # 期会被打满；旧 claw 已经被 Step 0 销毁，这里只能等池子腾出位置。重试期间
 # 这个账号是停服状态，所以预算不宜过长。

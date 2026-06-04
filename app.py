@@ -33,11 +33,29 @@ ACCOUNTS_DIR = BASE_DIR / "accounts"
 CURRENT_ACCOUNT_FILE = ACCOUNTS_DIR / "_current.json"
 MIMO_BASE = "https://aistudio.xiaomimimo.com"
 
-# Optional: pin aistudio.xiaomimimo.com to a specific gateway IP (e.g. a mainland
-# edge node) so the panel's own create + chat.send land on that PoP regardless of
-# GeoDNS. SNI/Host stay the domain, so TLS still validates. Find a current
-# mainland edge via a mainland resolver: nslookup aistudio.xiaomimimo.com 223.5.5.5
-_MIMO_PIN_IP = os.environ.get("MIMO_PIN_IP") or None
+# Pin aistudio.xiaomimimo.com to a specific gateway IP (e.g. a mainland edge
+# node) so the panel's own create + chat.send land on that PoP regardless of
+# GeoDNS — this is what bypasses MiMo's source-IP region gating. SNI/Host stay
+# the domain, so TLS still validates. The pinned IP is a persisted config:
+# env MIMO_PIN_IP wins, else data/pin_config.json {"aistudio_pin_ip": "..."}.
+# Storing it in config (not just env) means a plain restart keeps the pin.
+# Find a current mainland edge via: nslookup aistudio.xiaomimimo.com 223.5.5.5
+_PIN_CONFIG_PATH = BASE_DIR / "data" / "pin_config.json"
+
+
+def _load_pin_ip() -> str | None:
+    env_ip = (os.environ.get("MIMO_PIN_IP") or "").strip()
+    if env_ip:
+        return env_ip
+    try:
+        cfg = json.loads(_PIN_CONFIG_PATH.read_text(encoding="utf-8"))
+        ip = (cfg.get("aistudio_pin_ip") or "").strip()
+        return ip or None
+    except (OSError, json.JSONDecodeError, ValueError, AttributeError):
+        return None
+
+
+_MIMO_PIN_IP = _load_pin_ip()
 if _MIMO_PIN_IP:
     import socket as _socket
     _mimo_pin_host = "aistudio.xiaomimimo.com"
