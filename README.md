@@ -35,16 +35,14 @@ python app.py                    # 或 bash run.sh，默认端口 8088
 
 打开 `http://localhost:8088`，用 `data/secrets.json` 里的 `panel_password` 登录。登录后在面板「🔑 密钥管理」页可查看 / 修改 / 轮换所有密钥（即时生效，无需重启）；被环境变量锁定的字段只读。
 
-### 登录小米账号（任选其一，可加多个账号）
+### 登录小米账号（纯 HTTP，无需浏览器；可加多个账号）
 
 ```bash
-# A. 纯 HTTP 交互式登录（无需浏览器，支持邮箱验证码）
-python claw/mimo_auth.py login
-
-# B. 浏览器登录后导出 Cookie（适合验证码/风控复杂时）
-pip install playwright && python -m playwright install chromium
-python claw/mimo_login_get_ck.py --output accounts/myacct.json
+python claw/mimo_auth.py login          # 交互式输入邮箱/密码，支持邮箱验证码 2FA
+# 或用环境变量免交互：MIMO_EMAIL=... MIMO_PASSWORD=... python claw/mimo_auth.py login
 ```
+
+> 登录走小米 SSO 的纯 HTTP 流程。若小米风控触发 geetest 图形验证码（常见于陌生 IP/设备），headless 无法自动通过——换干净 IP/已知设备重试，或在浏览器登录后把 `.xiaomimimo.com` 域的 `serviceToken` / `userId` / `xiaomichatbot_ph` 手动存进 `accounts/<标签>.json` 的 `cookies` 数组。
 
 ### （可选）配置 SSH 自动部署
 要用「定时把 Claw 变成 API 转发节点」，按下文「自动部署流程（SSH 反向隧道 · 方案 B）」配置 `data/ssh_targets.json` + 目标机一次性 `setup-target.sh`。
