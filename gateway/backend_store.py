@@ -149,6 +149,37 @@ def add_backend(
     return entry
 
 
+def upsert_account_backend(
+    *, account_id: str, base_url: str, api_key: str = "",
+    models: Any = None, name: str = "",
+) -> dict[str, Any]:
+    """Create or update the backend bound to an account. Used by the SSH deploy
+    to point the account at its reverse-tunnel upstream (http://host:port).
+    Matches the first existing backend with this account_id; else creates one."""
+    base_url = (base_url or "").strip().rstrip("/")
+    with _lock:
+        data = _load()
+        for b in data["backends"]:
+            if b.get("account_id") == account_id:
+                existing_id = b["id"]
+                break
+        else:
+            existing_id = None
+    if existing_id:
+        fields: dict[str, Any] = {"base_url": base_url, "api_key": api_key,
+                                  "enabled": True, "lifecycle": "warming"}
+        if models:
+            fields["models"] = models
+        return update_backend(existing_id, **fields)
+    return add_backend(
+        name=name or account_id,
+        base_url=base_url,
+        models=models or ["mimo-v2.5-pro"],
+        api_key=api_key,
+        account_id=account_id,
+    )
+
+
 def update_backend(backend_id: str, **fields: Any) -> dict[str, Any] | None:
     allowed = {"name", "base_url", "models", "api_key", "weight",
                "account_id", "enabled", "lifecycle", "generation_id",
