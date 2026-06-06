@@ -19,6 +19,7 @@ from typing import Any
 from gateway.reasoning_cache import (
     derive_conversation_key,
     lookup_reasoning,
+    model_supports_reasoning,
     remember_reasoning,
 )
 from gateway.core import (
@@ -362,8 +363,12 @@ class OpenAIChatAdapter(ProtocolAdapter):
         prefix_blob = b"["
         first = True
         serialized: list[dict[str, Any]] = []
+        # reasoning_content rehydration only applies to thinking models; voice
+        # models (TTS/ASR) never have reasoning to restore. See MiMo's
+        # passing-back-reasoning_content notice.
+        rehydrate_reasoning = model_supports_reasoning(req.model)
         for m in req.messages:
-            if m.role == "assistant":
+            if m.role == "assistant" and rehydrate_reasoning:
                 # The hash for this assistant turn is the conversation as
                 # it was *before* the model produced this turn — i.e., all
                 # messages that came before, plus the request's tool surface

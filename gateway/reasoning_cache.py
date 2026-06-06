@@ -31,6 +31,7 @@ import hashlib
 import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -268,6 +269,21 @@ def _purge_expired(conn: sqlite3.Connection) -> None:
 
 
 # ────────────── key shape ──────────────
+
+
+_VOICE_MODEL_RE = re.compile(r"tts|asr|voiceclone|voicedesign", re.IGNORECASE)
+
+
+def model_supports_reasoning(model: str | None) -> bool:
+    """Reasoning/thinking rehydration applies to MiMo *thinking* models only.
+
+    Voice models (TTS / ASR) never emit ``reasoning_content``, so rehydrating
+    it onto their history is meaningless and would push a junk field upstream.
+    Per MiMo's "passing back reasoning_content" notice the affected thinking
+    models are mimo-v2.5-pro / v2.5 / v2-pro / v2-omni / v2-flash; we exclude
+    voice models by name so future thinking models stay covered automatically.
+    """
+    return not _VOICE_MODEL_RE.search(model or "")
 
 
 def derive_conversation_key(canonical: bytes) -> str:

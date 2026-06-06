@@ -31,6 +31,7 @@ from typing import Any
 from gateway.reasoning_cache import (
     derive_conversation_key,
     lookup_reasoning,
+    model_supports_reasoning,
     remember_reasoning,
 )
 
@@ -216,6 +217,10 @@ def patch_request_thinking(body: dict[str, Any]) -> int:
     if not isinstance(messages, list):
         return 0
 
+    # Only thinking models get reasoning/thinking rehydration; voice models
+    # (TTS/ASR) never emit it. The null-content normalization below still runs
+    # for all models. See MiMo's passing-back-reasoning_content notice.
+    supports_reasoning = model_supports_reasoning(body.get("model"))
     patched = 0
     for idx, msg in enumerate(messages):
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -248,7 +253,7 @@ def patch_request_thinking(body: dict[str, Any]) -> int:
                 if isinstance(tid, str) and tid:
                     tool_use_ids.append(tid)
 
-        if has_thinking or not tool_use_ids:
+        if has_thinking or not tool_use_ids or not supports_reasoning:
             continue
 
         # Conversation key scopes the lookup to this conversation's history
