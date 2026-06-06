@@ -1883,11 +1883,11 @@ async def gateway_backend_delete(backend_id: str):
 
 
 @app.get("/api/gateway/metrics")
-async def gateway_metrics():
-    """Request metrics for the metrics page."""
+async def gateway_metrics(offset: int = 0, limit: int = 50):
+    """Request metrics for the metrics page (recent list is paginated)."""
     try:
         from gateway.metrics import get_metrics_summary
-        return get_metrics_summary()
+        return get_metrics_summary(offset=max(0, offset), limit=max(1, min(limit, 200)))
     except ImportError:
         return {"error": "Gateway module not installed"}
 

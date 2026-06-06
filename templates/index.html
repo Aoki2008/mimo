@@ -694,9 +694,14 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       <div class="section">
         <h2>请求日志</h2>
         <table class="data-table">
-          <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>后端</th><th>状态</th><th>延迟</th><th>格式</th><th>Tokens</th></tr></thead>
-          <tbody id="metricsLogBody"><tr><td colspan="8" style="color:var(--text3);text-align:center;padding:20px">加载中...</td></tr></tbody>
+          <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>模型</th><th>后端</th><th>状态</th><th>延迟</th><th>格式</th><th>Tokens</th></tr></thead>
+          <tbody id="metricsLogBody"><tr><td colspan="9" style="color:var(--text3);text-align:center;padding:20px">加载中...</td></tr></tbody>
         </table>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:10px;font-size:.85rem">
+          <button class="btn" id="metricsPrev" onclick="metricsPage(-1)">上一页</button>
+          <span id="metricsPageInfo" style="color:var(--text2)"></span>
+          <button class="btn" id="metricsNext" onclick="metricsPage(1)">下一页</button>
+        </div>
       </div>
     </div>
 
@@ -1954,8 +1959,14 @@ function mgSaveMappingDialog() {
   });
 }
 
+var metricsOffset = 0;
+var METRICS_PAGE = 50;
+function metricsPage(delta) {
+  metricsOffset = Math.max(0, metricsOffset + delta * METRICS_PAGE);
+  refreshMetrics();
+}
 function refreshMetrics() {
-  api('GET', '/api/gateway/metrics').then(function(d) {
+  api('GET', '/api/gateway/metrics?offset=' + metricsOffset + '&limit=' + METRICS_PAGE).then(function(d) {
     if (d.error) return;
     document.getElementById('metTotalReq').textContent = d.total_24h || 0;
     document.getElementById('metSuccessRate').textContent = (d.success_rate || '--') + '%';
@@ -1970,7 +1981,7 @@ function refreshMetrics() {
     var el = document.getElementById('metricsLogBody');
     var logs = d.recent || [];
     if (logs.length === 0) {
-      el.innerHTML = '<tr><td colspan="8" style="color:var(--text3);text-align:center;padding:20px">暂无近期请求</td></tr>';
+      el.innerHTML = '<tr><td colspan="9" style="color:var(--text3);text-align:center;padding:20px">暂无近期请求</td></tr>';
     } else {
       var html = '';
       for (var i = 0; i < logs.length; i++) {
@@ -1981,6 +1992,7 @@ function refreshMetrics() {
         html += '<td style="font-size:0.78rem;color:var(--text2)">' + escapeHtml(r.time || '') + '</td>';
         html += '<td>' + escapeHtml(r.method || '') + '</td>';
         html += '<td style="font-family:monospace;font-size:0.82rem">' + escapeHtml(r.path || '') + '</td>';
+        html += '<td style="font-size:0.82rem">' + escapeHtml(r.model || '') + '</td>';
         html += '<td>' + escapeHtml(r.backend || '') + '</td>';
         html += '<td style="color:' + sc + '">' + (r.status || '') + '</td>';
         html += '<td>' + (r.latency_ms ? r.latency_ms + 'ms' : '--') + '</td>';
@@ -1990,6 +2002,20 @@ function refreshMetrics() {
       }
       el.innerHTML = html;
     }
+
+    var total = d.total_records || 0;
+    var off = d.offset || 0;
+    var lim = d.limit || METRICS_PAGE;
+    var info = document.getElementById('metricsPageInfo');
+    if (info) {
+      var from = total === 0 ? 0 : off + 1;
+      var to = Math.min(off + lim, total);
+      info.textContent = from + '-' + to + ' / \u5171 ' + total + ' \u6761';
+    }
+    var prev = document.getElementById('metricsPrev');
+    var next = document.getElementById('metricsNext');
+    if (prev) prev.disabled = off <= 0;
+    if (next) next.disabled = off + lim >= total;
   }).catch(function() {
     document.getElementById('metTotalReq').textContent = '--';
     document.getElementById('metSuccessRate').textContent = '--';

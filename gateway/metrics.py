@@ -347,8 +347,8 @@ def _percentile(conn: sqlite3.Connection, since: float, pct: float) -> float:
     return float(row[0]) if row else 0.0
 
 
-def get_metrics_summary() -> dict:
-    """Top-line stats + recent requests for the panel's metrics page."""
+def get_metrics_summary(offset: int = 0, limit: int = 50) -> dict:
+    """Top-line stats + a page of recent requests for the panel's metrics page."""
     try:
         conn = _get_thread_conn()
         now = time.time()
@@ -371,11 +371,14 @@ def get_metrics_summary() -> dict:
         p95_latency = round(_percentile(conn, since, 0.95), 1)
         p99_latency = round(_percentile(conn, since, 0.99), 1)
 
+        total_records = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] or 0
+
         recent = []
         for r in conn.execute(
             "SELECT ts, method, path, backend_id, status_code, latency_ms, "
             "source_format, is_stream, error, prompt_tokens, completion_tokens, model "
-            "FROM requests ORDER BY ts DESC LIMIT 50"
+            "FROM requests ORDER BY ts DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall():
             recent.append({
                 "ts": r[0],
@@ -404,6 +407,9 @@ def get_metrics_summary() -> dict:
             "completion_tokens_24h": completion_tokens_24h,
             "total_tokens_24h": prompt_tokens_24h + completion_tokens_24h,
             "recent": recent,
+            "offset": offset,
+            "limit": limit,
+            "total_records": total_records,
         }
     except Exception as e:
         return {
@@ -417,6 +423,9 @@ def get_metrics_summary() -> dict:
             "completion_tokens_24h": 0,
             "total_tokens_24h": 0,
             "recent": [],
+            "offset": offset,
+            "limit": limit,
+            "total_records": 0,
             "error": str(e),
         }
 
