@@ -29,6 +29,28 @@ class FakeTransport:
         pass
 
 
+class FakeStreamTransport:
+    def __init__(self, chunks: list[bytes]):
+        self.chunks = chunks
+        self.calls: list[str] = []
+
+    async def post_json(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=60.0):
+        raise AssertionError("json not used")
+
+    async def post_stream(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=600.0):
+        self.calls.append(url)
+
+        async def gen():
+            for chunk in self.chunks:
+                await asyncio.sleep(0)
+                yield chunk
+
+        return 200, gen()
+
+    async def close(self):
+        pass
+
+
 class FakeMetrics:
     def __init__(self):
         self.rows = []
@@ -57,6 +79,23 @@ def _payload(model: str = "m") -> bytes:
 
 def _body(model: str = "m") -> dict[str, Any]:
     return {"model": model, "messages": [{"role": "user", "content": "hi"}]}
+
+
+def _stream_body(model: str = "m") -> dict[str, Any]:
+    body = _body(model)
+    body["stream"] = True
+    return body
+
+
+def _sse(payload: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+async def _drain(stream):
+    out = bytearray()
+    async for chunk in stream:
+        out.extend(chunk)
+    return bytes(out)
 
 
 def test_non_stream_retries_next_backend_on_5xx(monkeypatch):
@@ -89,8 +128,60 @@ def test_non_stream_retries_next_backend_on_5xx(monkeypatch):
     ]
     assert metrics.rows[0]["backend_id"] == "a"
     assert metrics.rows[0]["status_code"] == 500
+    assert metrics.rows[0]["ttft_ms"] == 0
     assert metrics.rows[1]["backend_id"] == "b"
     assert metrics.rows[1]["status_code"] == 200
+    assert metrics.rows[1]["ttft_ms"] > 0
+    assert metrics.rows[1]["latency_ms"] >= metrics.rows[1]["ttft_ms"]
+
+
+def test_stream_records_ttft_after_first_client_chunk(monkeypatch):
+    monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
+    backend = Backend(backend_id="a", base_url="http://a", models=["m"])
+    backend.record_success()
+    chunks = [
+        _sse({
+            "id": "chatcmpl-stream",
+            "model": "m",
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }),
+        _sse({
+            "id": "chatcmpl-stream",
+            "model": "m",
+            "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": None}],
+        }),
+        _sse({
+            "id": "chatcmpl-stream",
+            "model": "m",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        }) + b"data: [DONE]\n\n",
+    ]
+    transport = FakeStreamTransport(chunks)
+    metrics = FakeMetrics()
+    handler = GatewayHandler(
+        router=Router(BackendRegistry([backend])),
+        transport=transport,
+        metrics=metrics,
+    )
+
+    content_type, stream, body = asyncio.run(
+        handler.handle(RequestContext(), OpenAIChatAdapter(), _stream_body())
+    )
+    assert content_type == "text/event-stream"
+    assert body == b""
+    assert stream is not None
+    raw = asyncio.run(_drain(stream))
+
+    assert b"data:" in raw
+    assert transport.calls == ["http://a/v1/chat/completions"]
+    assert len(metrics.rows) == 1
+    row = metrics.rows[0]
+    assert row["status_code"] == 200
+    assert row["ttft_ms"] > 0
+    assert row["latency_ms"] >= row["ttft_ms"]
+    assert row["prompt_tokens"] == 1
+    assert row["completion_tokens"] == 2
 
 
 def test_allowed_models_are_enforced_before_routing(monkeypatch):

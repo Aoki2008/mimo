@@ -95,6 +95,7 @@ class MetricsRecorder(Protocol):
         backend_id: str,
         status_code: int,
         latency_ms: float,
+        ttft_ms: float = 0,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         error: str = "",
@@ -370,6 +371,7 @@ class GatewayHandler:
 
             self._record_metric(
                 ctx, backend.backend_id, status, latency_ms,
+                ttft_ms=latency_ms,
                 prompt_tokens=prompt_t, completion_tokens=completion_t,
             )
 
@@ -465,8 +467,11 @@ class GatewayHandler:
         async def counted_chunks() -> AsyncIterator[bytes]:
             error = ""
             completed = False
+            ttft_ms = 0.0
             try:
                 async for chunk in teed:
+                    if ttft_ms <= 0:
+                        ttft_ms = (time.monotonic() - started) * 1000
                     ctx.response_chunks += 1
                     yield chunk
                 completed = True
@@ -482,6 +487,7 @@ class GatewayHandler:
                             ctx=ctx, backend_id=bid,
                             status_code=status if completed else 0,
                             latency_ms=latency_ms,
+                            ttft_ms=ttft_ms,
                             prompt_tokens=usage_sink.get("input_tokens", 0),
                             completion_tokens=usage_sink.get("output_tokens", 0),
                             error=error,
@@ -611,6 +617,7 @@ class GatewayHandler:
             prompt_t, completion_t = _extract_token_counts(events)
             self._record_metric(
                 ctx, backend.backend_id, status, latency_ms,
+                ttft_ms=latency_ms,
                 prompt_tokens=prompt_t, completion_tokens=completion_t,
             )
 
@@ -732,8 +739,11 @@ class GatewayHandler:
         async def counted_chunks() -> AsyncIterator[bytes]:
             error = ""
             completed = False
+            ttft_ms = 0.0
             try:
                 async for chunk in client_bytes:
+                    if ttft_ms <= 0:
+                        ttft_ms = (time.monotonic() - started) * 1000
                     ctx.response_chunks += 1
                     yield chunk
                 completed = True
@@ -748,6 +758,7 @@ class GatewayHandler:
                         recorder.record(
                             ctx=ctx, backend_id=bid, status_code=status if completed else 0,
                             latency_ms=latency_ms,
+                            ttft_ms=ttft_ms,
                             prompt_tokens=captured["prompt"],
                             completion_tokens=captured["completion"],
                             error=error,
@@ -759,7 +770,7 @@ class GatewayHandler:
 
     def _record_metric(
         self, ctx: RequestContext, backend_id: str, status_code: int,
-        latency_ms: float, *, prompt_tokens: int = 0,
+        latency_ms: float, *, ttft_ms: float = 0, prompt_tokens: int = 0,
         completion_tokens: int = 0, error: str = "",
     ) -> None:
         if self._metrics is None:
@@ -767,7 +778,7 @@ class GatewayHandler:
         try:
             self._metrics.record(
                 ctx=ctx, backend_id=backend_id, status_code=status_code,
-                latency_ms=latency_ms, prompt_tokens=prompt_tokens,
+                latency_ms=latency_ms, ttft_ms=ttft_ms, prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens, error=error,
             )
         except Exception:

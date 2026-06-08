@@ -46,8 +46,8 @@ def _seed_basic(m):
     for i in range(5):
         m.record_request(
             "POST", "/v1/chat/completions", backend_id="b1",
-            status_code=200, latency_ms=100 + i * 10,
-            source_format="openai", is_stream=False,
+            status_code=200, latency_ms=100 + i * 10, ttft_ms=40 + i * 10,
+            source_format="openai", is_stream=(i == 0),
             prompt_tokens=10, completion_tokens=20, model="m",
         )
     m.record_request(
@@ -61,16 +61,16 @@ def test_record_request_persists_token_columns(metrics_module):
     m = metrics_module
     m.record_request(
         "POST", "/v1/chat/completions", backend_id="b1",
-        status_code=200, latency_ms=42.5,
+        status_code=200, latency_ms=42.5, ttft_ms=12.5,
         prompt_tokens=11, completion_tokens=22,
         model="model-x", request_id="rid-1",
     )
     conn = m._get_thread_conn()
     row = conn.execute(
-        "SELECT prompt_tokens, completion_tokens, model, request_id "
+        "SELECT prompt_tokens, completion_tokens, model, request_id, ttft_ms "
         "FROM requests WHERE backend_id=?", ("b1",),
     ).fetchone()
-    assert row == (11, 22, "model-x", "rid-1")
+    assert row == (11, 22, "model-x", "rid-1", 12.5)
 
 
 def test_summary_counts_24h_and_tokens(metrics_module):
@@ -146,6 +146,60 @@ def test_public_totals_aggregates_all_time(metrics_module):
     assert p["since"]  # non-empty date string
 
 
+def test_public_totals_includes_latency_and_top_models(metrics_module):
+    _seed_basic(metrics_module)
+    p = metrics_module.get_public_totals()
+    assert p["latency"] == {"p50": 120.0, "p95": 140.0, "p99": 140.0, "avg": 120.0}
+    assert p["ttft"] == {"p50": 60.0, "p95": 80.0, "p99": 80.0, "avg": 60.0}
+    assert p["status_codes"] == {"200": 5, "500": 1}
+    assert p["models"] == [{
+        "name": "m",
+        "requests": 5,
+        "tokens": 150,
+        "streaming_requests": 1,
+        "non_streaming_requests": 4,
+    }]
+    assert p["routes"][0] == {
+        "name": "m",
+        "requests": 5,
+        "success": 5,
+        "fail": 0,
+        "success_rate": 100.0,
+        "avg_latency": 120.0,
+        "p95_latency": 140.0,
+        "avg_ttft": 60.0,
+        "p95_ttft": 80.0,
+        "streaming_requests": 1,
+        "non_streaming_requests": 4,
+        "prompt_tokens": 50,
+        "completion_tokens": 100,
+        "tokens": 150,
+        "status": "operational",
+    }
+
+
+def test_public_hourly_returns_requested_window(metrics_module):
+    m = metrics_module
+    m.record_request(
+        "POST", "/v1/chat/completions", backend_id="private-backend",
+        status_code=200, latency_ms=50, ttft_ms=20,
+        prompt_tokens=1, completion_tokens=2,
+        model="m",
+    )
+    buckets = m.get_public_hourly(hours=24)
+    assert len(buckets) == 24
+    assert buckets[-1]["requests"] == 1
+    assert buckets[-1]["success"] == 1
+    assert buckets[-1]["success_rate"] == 100.0
+    assert buckets[-1]["avg_ttft"] == 20.0
+    assert buckets[-1]["p95_ttft"] == 20.0
+    assert buckets[-1]["status"] == "operational"
+    assert buckets[-1]["tokens"] == 3
+    assert buckets[0]["ts"] == buckets[-1]["ts"] - 23 * 3600
+    assert "backend" not in buckets[-1]
+    assert "backend_id" not in buckets[-1]
+
+
 def test_sqlite_recorder_writes_via_protocol(metrics_module):
     m = metrics_module
     rec = m.SQLiteMetricsRecorder()
@@ -198,7 +252,7 @@ def test_init_migrates_legacy_schema(tmp_path):
     fresh = m._get_conn()
     m._init_db(fresh)
     cols = {r[1] for r in fresh.execute("PRAGMA table_info(requests)").fetchall()}
-    assert {"prompt_tokens", "completion_tokens", "model", "request_id"} <= cols
+    assert {"prompt_tokens", "completion_tokens", "model", "request_id", "ttft_ms"} <= cols
     fresh.close()
 
 

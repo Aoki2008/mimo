@@ -1967,10 +1967,26 @@ async def public_status(request: Request, key: str = ""):
     if not expected or not supplied or not hmac.compare_digest(supplied, expected):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     try:
-        from gateway.metrics import get_public_totals
+        from gateway.metrics import get_public_totals, get_public_hourly
         data = get_public_totals()
+        data["hourly"] = get_public_hourly(hours=24)
     except ImportError:
-        data = {"total_requests": 0, "total_tokens": 0}
+        data = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "success_rate": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "since_ts": 0,
+            "since": "",
+            "latency": {"p50": 0, "p95": 0, "p99": 0, "avg": 0},
+            "ttft": {"p50": 0, "p95": 0, "p99": 0, "avg": 0},
+            "status_codes": {},
+            "models": [],
+            "routes": [],
+            "hourly": [],
+        }
     # Operational summary (counts only — never expose backend identities).
     operational, online = True, 0
     try:
