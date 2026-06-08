@@ -1959,7 +1959,8 @@ async def public_status(request: Request, key: str = ""):
 
     Requires the dedicated ``status_api_token`` (NOT the API or panel token),
     via ``Authorization: Bearer <token>`` / ``X-Status-Key`` header or ``?key=``.
-    Returns only curated, non-sensitive aggregates — no backend names or keys."""
+    Returns only curated, non-sensitive aggregates — no backend names or keys.
+    The public hourly series covers the last 48 hours."""
     expected = _secrets.status_api_token
     auth = request.headers.get("authorization", "")
     bearer = auth[7:].strip() if auth.startswith("Bearer ") else ""
@@ -1969,7 +1970,7 @@ async def public_status(request: Request, key: str = ""):
     try:
         from gateway.metrics import get_public_totals, get_public_hourly
         data = get_public_totals()
-        data["hourly"] = get_public_hourly(hours=24)
+        data["hourly"] = get_public_hourly(hours=48)
     except ImportError:
         data = {
             "total_requests": 0,

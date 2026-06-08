@@ -298,7 +298,7 @@ sudo ./claw/target/setup-target.sh "$(cat panel_tunnel_key.pub)"
 - `GET /api/gateway/vps` / `POST /api/gateway/vps/refresh` — 节点状态
 
 ### 公开端点
-- `GET /api/public/status` — 状态页数据 JSON（**需独立 `status_api_token`**：`Authorization: Bearer <token>` / `X-Status-Key` / `?key=`），返回脱敏聚合（总量、成功率、tokens、状态码分布、延迟/TTFT 分位、带可用性状态的 24h 分时、Top routes/models、流式/非流式计数、operational、在线后端数；不含后端身份）
+- `GET /api/public/status` — 状态页数据 JSON（**需独立 `status_api_token`**：`Authorization: Bearer <token>` / `X-Status-Key` / `?key=`），返回脱敏聚合（总量、成功率、tokens、状态码分布、延迟/TTFT 分位、带可用性状态的 48h 分时、Top routes/models、流式/非流式计数、operational、在线后端数；不含后端身份）
 - `GET /health` — Gateway 进程健康
 - `GET /gateway/status` — 公开 Gateway 状态
 - `GET /probe/agent.py` / `GET /probe/install.sh/{token}` — 探针安装资源
