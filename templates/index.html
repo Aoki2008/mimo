@@ -275,9 +275,6 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       <span class="icon">⚡</span><span>网关状态</span>
       <span class="badge green" id="gwBadge">正常</span>
     </div>
-    <div class="nav-item" data-page="freeapi" onclick="switchPage('freeapi')">
-      <span class="icon">🌐</span><span>代理配置</span>
-    </div>
     <div class="nav-item" data-page="backends" onclick="switchPage('backends')">
       <span class="icon">🖥️</span><span>后端</span>
     </div>
@@ -824,7 +821,235 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     
 </div>
 
-<div class="page" id="page-freeapi">
+<div class="page" id="page-backends">
+      <div class="section" style="display:flex;align-items:center;justify-content:space-between">
+        <h2 style="margin:0">后端服务器</h2>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="backendToggleAdd()">添加后端</button>
+          <button class="btn btn-ghost" onclick="backendReload()">重载</button>
+        </div>
+      </div>
+
+      <!-- Add/Edit panel -->
+      <div class="section" id="backendAddPanel" style="display:none">
+        <h3 id="backendFormTitle">添加后端</h3>
+        <input type="hidden" id="backendEditId" value="">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:700px">
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">名称 *</label>
+            <input id="beName" placeholder="e.g. mimo-claw-1" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">Base URL *</label>
+            <input id="beUrl" placeholder="http://127.0.0.1:8088" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">API Key</label>
+            <input id="beKey" placeholder="(可选，留空使用 secrets.upstream_api_key)" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">权重</label>
+            <input id="beWeight" type="number" value="1" min="1" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          </div>
+        </div>
+        <div style="margin-top:12px;max-width:700px">
+          <label style="font-size:.8rem;color:var(--text2)">Models 服务的原生模型 * <span style="color:var(--text3);font-weight:normal">（一个 Claw 通常服务 9 个）</span></label>
+          <div id="beModelsChips" style="min-height:42px;padding:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px">
+            <input id="beModelsInput" type="text" placeholder="输入模型名后按 Enter 或逗号" style="flex:1;min-width:180px;border:none;background:transparent;color:var(--text);font-size:.85rem;outline:none">
+          </div>
+          <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">
+            <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beFillMimoNative()">一键填充 9 个 MiMo 原生模型</button>
+            <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beClearModels()">清空</button>
+          </div>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px">
+          <button class="btn btn-primary" onclick="backendSave()">保存</button>
+          <button class="btn btn-ghost" onclick="backendToggleAdd()">取消</button>
+        </div>
+      </div>
+
+      <table class="data-table" id="backendsTable" style="margin-top:10px">
+        <thead><tr><th>名称</th><th>Models</th><th>URL</th><th>状态</th><th>延迟</th><th>请求数</th><th>操作</th></tr></thead>
+        <tbody id="backendsBody"><tr><td colspan="7" style="color:var(--text3);text-align:center;padding:20px">加载中...</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- ════ Model Mappings ════ -->
+    <div class="page" id="page-mappings">
+      <div class="section" style="display:flex;align-items:center;justify-content:space-between">
+        <h2 style="margin:0">模型映射</h2>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="mgNewGroup()">新建分组</button>
+          <button class="btn btn-ghost" onclick="mgImportBackends()">从后端导入</button>
+        </div>
+      </div>
+      <div id="mgInfo" style="color:var(--text3);font-size:.82rem;padding:6px 0 12px 0">
+        客户端用 <code>exposed_name</code> 调 <code>/v1/chat/completions</code>、<code>/v1/responses</code> 或 <code>/v1/messages</code>；网关查到映射后用 <code>native_model</code> 转发上游。映射持久化在 <code>data/model_groups.json</code>，无匹配返回 <code>model_not_found</code>。
+      </div>
+      <div id="mgGroupsContainer"></div>
+    </div>
+
+    <!-- ════ Metrics ════ -->
+    <div class="page" id="page-metrics">
+      <div class="grid">
+        <div class="metric-card">
+          <div class="metric-value" id="metTotalReq">--</div>
+          <div class="metric-label">24h 总请求</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="metSuccessRate">--</div>
+          <div class="metric-label">成功率</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="metP95">--</div>
+          <div class="metric-label">P95 延迟</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="metErrors">--</div>
+          <div class="metric-label">24h 错误数</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="metTokens">--</div>
+          <div class="metric-label">24h 总 Tokens</div>
+          <div class="metric-change" id="metTokensSplit"></div>
+        </div>
+      </div>
+      <div class="section">
+        <h2>近 24 小时请求量（窗格）</h2>
+        <div class="hour-grid" id="hourGrid"></div>
+        <div class="hour-axis" id="hourAxis"></div>
+      </div>
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(360px,1fr))">
+        <div class="section">
+          <h2>HTTP 状态分布</h2>
+          <div class="status-bars" id="statusBars">
+            <div style="color:var(--text3);font-size:0.82rem">加载中…</div>
+          </div>
+        </div>
+        <div class="section">
+          <h2>后端排行</h2>
+          <table class="data-table">
+            <thead><tr><th>后端</th><th>请求</th><th>成功率</th><th>平均延迟</th><th>Tokens</th></tr></thead>
+            <tbody id="backendStatsBody">
+              <tr><td colspan="5" style="color:var(--text3);text-align:center;padding:14px">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="section">
+        <h2>请求日志</h2>
+        <table class="data-table">
+          <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>模型</th><th>后端</th><th>状态</th><th>延迟</th><th>格式</th><th>Tokens</th></tr></thead>
+          <tbody id="metricsLogBody"><tr><td colspan="9" style="color:var(--text3);text-align:center;padding:20px">加载中...</td></tr></tbody>
+        </table>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:10px;font-size:.85rem">
+          <button class="btn" id="metricsPrev" onclick="metricsPage(-1)">上一页</button>
+          <span id="metricsPageInfo" style="color:var(--text2)"></span>
+          <button class="btn" id="metricsNext" onclick="metricsPage(1)">下一页</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ VPS Monitoring ════ -->
+    <div class="page" id="page-vps">
+      <div class="section" style="display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <h2 style="margin:0">节点状态</h2>
+          <div id="vpsSummary" style="color:var(--text3);font-size:0.8rem;margin-top:4px">加载中…</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="vpsToggleAdd()">添加节点</button>
+          <button class="btn btn-primary" onclick="refreshVps()">刷新</button>
+        </div>
+      </div>
+      <div class="section" id="vpsAddPanel" style="display:none">
+        <h3 style="margin:0 0 10px 0;font-size:0.95rem">新增 VPS 节点</h3>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+          <input type="text" id="vpsNewName" placeholder="节点名（如 vps-tokyo）"
+                 style="flex:1;padding:8px;background:#0d1b2a;border:1px solid var(--border);border-radius:6px;color:var(--text)">
+          <button class="btn btn-primary" onclick="vpsAddNode()">创建并生成 token</button>
+        </div>
+        <div id="vpsAddResult" style="font-size:0.78rem;color:var(--text2)"></div>
+      </div>
+      <div class="vps-grid" id="vpsGrid"></div>
+    </div>
+
+    <!-- ════ API Docs ════ -->
+    <div class="page" id="page-api-docs">
+      <div class="section">
+        <h2>支持的端点</h2>
+        <table class="data-table">
+          <thead><tr><th>端点</th><th>方法</th><th>认证</th><th>描述</th></tr></thead>
+          <tbody>
+            <tr><td><code>/v1/chat/completions</code></td><td>POST</td><td>Bearer</td><td>OpenAI 原生格式</td></tr>
+            <tr><td><code>/v1/messages</code></td><td>POST</td><td>Bearer</td><td>Anthropic 原生透传</td></tr>
+            <tr><td><code>/v1/responses</code></td><td>POST</td><td>Bearer</td><td>Responses 格式 → OpenAI</td></tr>
+            <tr><td><code>/v1/models</code></td><td>GET</td><td>无</td><td>列出映射后的可用模型</td></tr>
+            <tr><td><code>/health</code></td><td>GET</td><td>无</td><td>公开健康检查</td></tr>
+            <tr><td><code>/api/public/status</code></td><td>GET</td><td>Status Key</td><td>状态页数据（需独立 status_api_token）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="section">
+        <h2>认证</h2>
+        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
+          <p>数据面写请求（<code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/v1/messages</code>）需要：</p>
+          <pre style="background:#0d1b2a;padding:12px;border-radius:6px;margin:10px 0;font-size:0.82rem;color:var(--text)">Authorization: Bearer sk-Aoki-MiMo</pre>
+          <p>网关会自动注入后端 API key，客户端只需提供网关 token。<code>/v1/models</code> 与 <code>/health</code> 公开可读；<code>/api/public/status</code> 使用独立的 <code>status_api_token</code>。</p>
+        </div>
+      </div>
+      <div class="section">
+        <h2>格式转换</h2>
+        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
+          <p><strong>OpenAI Chat / Responses</strong>：走统一适配链路，<code>/v1/responses</code> 会转换到上游 Chat 格式并路由到最佳可用后端。</p>
+          <p style="margin-top:8px"><strong>Anthropic Messages</strong>：<code>/v1/messages</code> 先做模型映射和能力校验，再直连上游 Anthropic 原生接口，保留 <code>thinking</code>、<code>signature</code> 与 beta header。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ Panel access control ════ -->
+    <div class="page" id="page-panel-acl">
+      <div class="section">
+        <h2>🔒 面板访问控制</h2>
+        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
+          <p>仅限列表内的 IP 访问管理面板。公开 API（<code>/v1/*</code>）、探针等端点不受此限制。</p>
+          <p style="margin-top:6px">你当前的 IP：<strong id="aclYourIp" style="color:var(--text)">--</strong>
+            <button class="btn btn-ghost" style="padding:3px 10px;margin-left:8px" onclick="aclAddMyIp()">加入我的 IP</button>
+          </p>
+          <p style="margin-top:6px;color:var(--yellow)">⚠️ 留空 = 不限制（任意 IP 可访问）。保存非空列表时，若不含你当前 IP 会被拒绝，避免把自己锁在外面。</p>
+        </div>
+      </div>
+      <div class="section">
+        <h2>白名单（每行一个 IP 或 CIDR）</h2>
+        <textarea id="aclTextarea" rows="8" placeholder="例如：&#10;203.0.113.5&#10;198.51.100.0/24" style="min-height:160px;font-family:monospace"></textarea>
+        <div class="btn-group">
+          <button class="btn btn-primary" id="aclSaveBtn" onclick="savePanelAcl()">保存</button>
+          <button class="btn btn-ghost" onclick="refreshPanelAcl()">重新加载</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ Secrets management ════ -->
+    <div class="page" id="page-secrets">
+      <div class="section">
+        <h2>🔑 密钥管理</h2>
+        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
+          <p>在此查看 / 修改 / 轮换面板与接口密钥（持久化到 <code>data/secrets.json</code>，改完即时生效，无需重启）。</p>
+          <p style="margin-top:6px;color:var(--yellow)">⚠️ 轮换<strong>公开 API token</strong> 会让现有客户端失效；修改<strong>面板会话 token</strong> 仅当前浏览器会自动续上 cookie，其它已登录会话会掉线。被<span style="color:var(--text)">环境变量锁定</span>的字段不可在此修改。</p>
+        </div>
+      </div>
+      <div class="section">
+        <div id="secretsBody"></div>
+        <div id="secretsStatus" class="secret-status" role="status" aria-live="polite"></div>
+        <div class="btn-group" style="margin-top:14px">
+          <button class="btn btn-primary" id="secretsSaveBtn" onclick="saveSecrets()">保存修改</button>
+          <button class="btn btn-ghost" onclick="refreshSecrets()">重新加载</button>
+        </div>
+      </div>
+    
+</div>
+
+<div class="page" id="page-backends">
   <div class="topbar">
     <div class="topbar-title">🌐 代理配置</div>
     <div class="topbar-right">MiMo Free API 多通道管理</div>
@@ -2978,180 +3203,7 @@ function addDirectIpField() {
   container.appendChild(div);
 }
 
-function addProxyPortField() {
-  const container = document.getElementById('fa-proxy-ports');
-  const div = document.createElement('div');
-  div.style.marginBottom = '6px';
-  div.style.display = 'flex';
-  div.style.gap = '6px';
-  div.innerHTML = '<input type="number" placeholder="11000" style="flex:1;font-family:monospace" min="1024" max="65535" onchange="saveFreeApiConfig()">'
-    + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
-  container.appendChild(div);
-}
 
-async function loadFreeApiConfig() {
-  const loadEl = document.getElementById('fa-loading');
-  const channelsEl = document.getElementById('fa-channels');
-  loadEl.style.display = 'block';
-  loadEl.textContent = '加载中...';
-  channelsEl.style.display = 'none';
-
-  try {
-    const resp = await fetch('/api/free-api/config');
-    const data = await resp.json();
-
-    document.getElementById('fa-enabled').checked = data.enabled || false;
-    document.getElementById('fa-models').value = (data.models || []).join(',');
-
-    // Direct IPs
-    const dc = document.getElementById('fa-direct-ips');
-    dc.innerHTML = '';
-    const ips = (data.direct_ips && data.direct_ips.length) ? data.direct_ips : ['auto'];
-    ips.forEach(ip => {
-      const div = document.createElement('div');
-      div.style.marginBottom = '6px';
-      div.style.display = 'flex';
-      div.style.gap = '6px';
-      div.innerHTML = '<input type="text" value="' + ip.replace(/"/g,'&quot;') + '" style="flex:1;font-family:monospace" onchange="saveFreeApiConfig()">'
-        + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
-      dc.appendChild(div);
-    });
-
-    // Proxy ports
-    const pc = document.getElementById('fa-proxy-ports');
-    pc.innerHTML = '';
-    (data.proxy_ports || []).forEach(port => {
-      const div = document.createElement('div');
-      div.style.marginBottom = '6px';
-      div.style.display = 'flex';
-      div.style.gap = '6px';
-      div.innerHTML = '<input type="number" value="' + port + '" style="flex:1;font-family:monospace" min="1024" max="65535" onchange="saveFreeApiConfig()">'
-        + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
-      pc.appendChild(div);
-    });
-
-    // Channels table
-    loadEl.style.display = 'none';
-    channelsEl.style.display = 'block';
-    const tableEl = document.getElementById('fa-channels-table');
-
-    if (data.channels && data.channels.length > 0) {
-      let html = '<table style="width:100%;border-collapse:collapse;font-size:0.82rem">';
-      html += '<thead><tr style="border-bottom:1px solid var(--border);color:var(--text3)">';
-      html += '<th style="padding:8px 6px;text-align:left">通道ID</th>';
-      html += '<th style="padding:8px 6px;text-align:left">类型</th>';
-      html += '<th style="padding:8px 6px;text-align:left">目标</th>';
-      html += '<th style="padding:8px 6px;text-align:center">健康</th>';
-      html += '<th style="padding:8px 6px;text-align:center">JWT</th>';
-      html += '<th style="padding:8px 6px;text-align:right">过期时间</th>';
-      html += '<th style="padding:8px 6px;text-align:center">操作</th>';
-      html += '</tr></thead><tbody>';
-
-      data.channels.forEach(ch => {
-        const expiresMin = ch.jwt_expires_in ? Math.floor(ch.jwt_expires_in / 60) + 'm' : '-';
-        const healthIcon = ch.healthy ? '<span class="indicator green"></span>' : '<span class="indicator red"></span>';
-        const jwtIcon = ch.has_jwt ? '<span class="indicator green"></span>' : '<span class="indicator gray"></span>';
-        const typeText = ch.type === 'direct' ? '直连' : '代理';
-
-        html += '<tr style="border-bottom:1px solid var(--border)">';
-        html += '<td style="padding:8px 6px;font-family:monospace;font-size:0.75rem">' + ch.id + '</td>';
-        html += '<td style="padding:8px 6px">' + typeText + '</td>';
-        html += '<td style="padding:8px 6px;font-family:monospace;font-size:0.75rem">' + ch.target + '</td>';
-        html += '<td style="padding:8px 6px;text-align:center">' + healthIcon + '</td>';
-        html += '<td style="padding:8px 6px;text-align:center">' + jwtIcon + '</td>';
-        html += '<td style="padding:8px 6px;text-align:right;font-size:0.75rem">' + expiresMin + '</td>';
-        html += '<td style="padding:8px 6px;text-align:center">';
-        html += '<button class="btn btn-ghost" onclick="testChannel(\'' + ch.id + '\')" style="font-size:0.75rem;padding:2px 8px">测试</button>';
-        html += '</td></tr>';
-
-        if (ch.last_error) {
-          html += '<tr style="border-bottom:1px solid var(--border)">';
-          html += '<td colspan="7" style="padding:2px 6px 8px;font-size:0.75rem;color:var(--red)">\u26a0 ' + ch.escaped_error + '</td>';
-          html += '</tr>';
-        }
-      });
-
-      html += '</tbody></table>';
-      tableEl.innerHTML = html;
-    } else {
-      tableEl.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3)">暂无通道，请先启用并配置</div>';
-    }
-  } catch(e) {
-    loadEl.textContent = '\u274c 加载失败: ' + e.message;
-  }
-}
-
-async function saveFreeApiConfig() {
-  const enabled = document.getElementById('fa-enabled').checked;
-  const modelsRaw = document.getElementById('fa-models').value;
-  const models = modelsRaw.split(',').map(s => s.trim()).filter(Boolean);
-
-  const directIps = [];
-  document.querySelectorAll('#fa-direct-ips input').forEach(inp => {
-    const v = inp.value.trim();
-    if (v) directIps.push(v);
-  });
-
-  const proxyPorts = [];
-  document.querySelectorAll('#fa-proxy-ports input').forEach(inp => {
-    const v = parseInt(inp.value);
-    if (!isNaN(v) && v > 0) proxyPorts.push(v);
-  });
-
-  try {
-    const resp = await fetch('/api/free-api/config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({enabled: enabled, models: models, direct_ips: directIps, proxy_ports: proxyPorts}),
-    });
-    const result = await resp.json();
-    if (result.success) {
-      showToast('\u2714 配置已保存', 'success');
-      loadFreeApiConfig();
-    } else {
-      showToast('\u274c ' + (result.error || '保存失败'), 'error');
-    }
-  } catch(e) {
-    showToast('\u274c ' + e.message, 'error');
-  }
-}
-
-async function testChannel(channelId) {
-  showToast('\ud83d\udd0d 测试中...', '');
-  try {
-    const resp = await fetch('/api/free-api/test/' + encodeURIComponent(channelId), {method: 'POST'});
-    const result = await resp.json();
-    if (result.success) {
-      showToast(channelId + ' \u2714\ufe0f ' + result.latency_ms + 'ms', 'success');
-    } else {
-      showToast(channelId + ' \u274c ' + result.error, 'error');
-    }
-  } catch(e) {
-    showToast('\u274c ' + e.message, 'error');
-  }
-}
-
-// Hook page switch
-(function() {
-  const orig = window.switchPage;
-  if (orig) {
-    window.switchPage = function(page) {
-      orig(page);
-      if (page === 'freeapi') loadFreeApiConfig();
-    };
-  }
-})();
-
-// Hook page switch
-(function() {
-  const orig = window.switchPage;
-  if (orig) {
-    window.switchPage = function(page) {
-      orig(page);
-      if (page === 'freeapi') loadFreeApiConfig();
-    };
-  }
-})();
 </script>
 </body>
 </html>
