@@ -33,7 +33,6 @@ from gateway.core import BadRequestError, GatewayError, RequestContext
 from gateway.handler import GatewayHandler
 from gateway.routing import Backend, BackendRegistry, InMemoryDecisionLog, Router
 from gateway.secrets_store import secrets
-from gateway.free_api import get_pool, make_free_api_backends
 from gateway.transport import HttpxTransport
 
 logger = logging.getLogger(__name__)
