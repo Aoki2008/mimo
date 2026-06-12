@@ -218,14 +218,6 @@ async def startup_event():
         start_router_probe()
     except Exception as e:
         logger.exception("[startup] Failed to start gateway probe")
-    try:
-        from gateway.free_api import get_pool
-        pool = get_pool()
-        pool.start()
-        loop = asyncio.get_running_loop()
-        loop.create_task(pool.start_async())
-    except Exception:
-        logger.exception("[startup] Failed to start free API pool")
     # Human-like WS activity loop: keeps each deployed Claw engaged, repairs the
     # reverse tunnel, and drives expiry/health rotation. Gated so a fresh host
     # stays quiet until accounts are verified.
@@ -256,12 +248,6 @@ async def shutdown_event():
         await shutdown_gateway_runtime()
     except Exception as e:
         logger.exception("[shutdown] Failed to close gateway runtime")
-    try:
-        from gateway.free_api import get_pool
-        pool = get_pool()
-        await pool.shutdown()
-    except Exception:
-        logger.exception("[shutdown] Failed to stop free API pool")
     try:
         from gateway.auth import close_key_store
         close_key_store()
