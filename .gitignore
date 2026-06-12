@@ -7,6 +7,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+.cache/
 
 # Distribution / packaging
 build/
@@ -51,10 +52,11 @@ data/probe_nodes.json
 # Gateway runtime config (often contains secrets)
 gateway.yaml
 
-# Archives / backups
+# Archives / backups / binaries
 *.zip
 *.tar.gz
 *.bak
+*.exe
 
 # HAR captures (browser-recorded HTTP archives — usually contain auth tokens)
 *.har
