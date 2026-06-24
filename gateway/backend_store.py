@@ -1,7 +1,10 @@
 """Persistent backend store — CRUD for the backends section of data/config.json.
 
 Each entry is a dict with:
-  id, name, base_url, models (list[str]), api_key, weight, enabled, account_id
+  id, name, base_url, models (list[str]), api_key, enabled, account_id
+
+Legacy ``weight`` values are still accepted/read so old config files migrate
+cleanly, but single-active routing no longer uses weighted selection.
 
 Legacy format with ``model`` (str) + ``aliases`` (comma-string) is migrated
 to ``models`` on read; written entries always use the new shape.
@@ -44,8 +47,18 @@ def _normalize_models(raw: Any) -> list[str]:
     return out
 
 
+def _normalize_lifecycle(raw: Any) -> str:
+    lifecycle = str(raw or "active")
+    if lifecycle in {"standby", "warming"}:
+        return "inactive"
+    if lifecycle in {"inactive", "active", "draining", "failed", "disabled"}:
+        return lifecycle
+    return "active"
+
+
 def _migrate_entry(entry: dict) -> dict:
     """If entry uses legacy {model, aliases}, fold them into models[]."""
+    entry["lifecycle"] = _normalize_lifecycle(entry.get("lifecycle"))
     if "models" in entry and isinstance(entry["models"], list):
         entry["models"] = _normalize_models(entry["models"])
         entry.pop("model", None)
@@ -200,6 +213,8 @@ def update_backend(backend_id: str, **fields: Any) -> dict[str, Any] | None:
                         v = _normalize_models(v)
                         if not v:
                             continue  # ignore empty list — keep old
+                    if k == "lifecycle":
+                        v = _normalize_lifecycle(v)
                     b[k] = v
                 _save(data)
                 return b

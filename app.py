@@ -210,13 +210,13 @@ async def startup_event():
         start_router_probe()
     except Exception as e:
         logger.exception("[startup] Failed to start gateway probe")
-    # Human-like WS activity loop: keeps each deployed Claw engaged, repairs the
-    # reverse tunnel, and drives expiry/health rotation. Gated so a fresh host
-    # stays quiet until accounts are verified.
+    # Human-like WS activity loop: keeps the deployed Claw engaged, repairs the
+    # reverse tunnel, and drives account relay/health recovery. Gated so a fresh
+    # host stays quiet until accounts are verified.
     if os.environ.get("DISABLE_CLAW_ACTIVITY") in ("1", "true", "yes"):
         logger.info("[startup] DISABLE_CLAW_ACTIVITY set — claw activity loop not started")
     elif os.environ.get("DISABLE_SCHEDULER") in ("1", "true", "yes"):
-        logger.info("[startup] DISABLE_SCHEDULER set — claw activity/rotation loop not started")
+        logger.info("[startup] DISABLE_SCHEDULER set — claw activity/relay loop not started")
     else:
         try:
             from claw.claw_activity import start_activity
@@ -1986,7 +1986,7 @@ async def gateway_backend_add(request: Request):
 
 @app.post("/api/gateway/backends/{backend_id}/update")
 async def gateway_backend_update(backend_id: str, request: Request):
-    """Update a backend's config (name, base_url, model, aliases, weight, api_key, enabled)."""
+    """Update a backend's config (name, base_url, models, api_key, enabled)."""
     body = await request.json()
     try:
         from gateway.backend_store import update_backend

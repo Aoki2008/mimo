@@ -170,10 +170,10 @@ def test_router_decision_records_candidates_considered():
     _, decision = r.choose(request_id="rid-xyz", model=a.models[0])
     assert set(decision.candidates_considered) == {"a", "b"}
     assert decision.request_id == "rid-xyz"
-    assert decision.reason == "score"
+    assert decision.reason == "active"
 
 
-# ───────── Backend load-balancing helpers ─────────
+# ───────── Backend request counters ─────────
 
 
 def test_backend_record_latency_seeds_then_smooths():
@@ -198,84 +198,24 @@ def test_backend_in_flight_counters_dont_go_negative():
     assert b.in_flight == 0
 
 
-def test_backend_routing_score_combines_latency_and_load():
-    b = _backend()
-    b.ewma_latency_ms = 100.0
-    b.in_flight = 0
-    assert b.routing_score() == pytest.approx(100.0)
-    b.in_flight = 1
-    assert b.routing_score() == pytest.approx(200.0)
-    b.weight = 2
-    assert b.routing_score() == pytest.approx(100.0)
+# ───────── Router single-active fallback ─────────
 
 
-def test_backend_routing_score_unobserved_uses_conservative_latency():
-    """Fresh active backends should not look faster than warmed peers."""
-    b = _backend()
-    assert b.ewma_latency_ms == 0.0
-    assert b.routing_score() == pytest.approx(100.0)
-
-
-# ───────── Router score-based selection ─────────
-
-
-def test_router_prefers_lower_latency():
-    fast = _backend(backend_id="fast")
-    slow = _backend(backend_id="slow")
-    fast.record_success()
-    slow.record_success()
-    fast.ewma_latency_ms = 50.0
-    slow.ewma_latency_ms = 500.0
-    r = Router(BackendRegistry([slow, fast]))
-    chosen, decision = r.choose(request_id="r1", model=fast.models[0])
-    assert chosen.backend_id == "fast"
-    assert decision.chosen_latency_ms == 50.0
-
-
-def test_router_prefers_lower_in_flight_on_latency_tie():
-    busy = _backend(backend_id="busy")
-    idle = _backend(backend_id="idle")
-    busy.record_success()
-    idle.record_success()
-    busy.ewma_latency_ms = 100.0
-    idle.ewma_latency_ms = 100.0
-    busy.in_flight = 5
-    idle.in_flight = 0
-    r = Router(BackendRegistry([busy, idle]))
-    chosen, decision = r.choose(request_id="r1", model=busy.models[0])
-    assert chosen.backend_id == "idle"
-    assert decision.chosen_in_flight == 0
-
-
-def test_router_spreads_equal_sequential_traffic_by_request_count():
+def test_router_uses_registry_order_for_legacy_multi_active_candidates():
     a = _backend(backend_id="a")
     b = _backend(backend_id="b")
     a.record_success()
     b.record_success()
-    a.ewma_latency_ms = 100.0
-    b.ewma_latency_ms = 100.0
-    a.total_requests = 0
-    b.total_requests = 0
+    a.ewma_latency_ms = 500.0
+    b.ewma_latency_ms = 50.0
+    b.weight = 99
     r = Router(BackendRegistry([a, b]))
 
-    first, _ = r.choose(request_id="r1", model=a.models[0])
-    first.record_latency(100.0)
-    second, _ = r.choose(request_id="r2", model=a.models[0])
+    chosen, decision = r.choose(request_id="r1", model=a.models[0])
 
-    assert {first.backend_id, second.backend_id} == {"a", "b"}
-
-
-def test_router_prefers_higher_weight_on_full_tie():
-    light = _backend(backend_id="light")
-    heavy = _backend(backend_id="heavy")
-    light.record_success()
-    heavy.record_success()
-    light.ewma_latency_ms = 100.0
-    heavy.ewma_latency_ms = 100.0
-    heavy.weight = 4
-    r = Router(BackendRegistry([light, heavy]))
-    chosen, _ = r.choose(request_id="r1", model=light.models[0])
-    assert chosen.backend_id == "heavy"
+    assert chosen.backend_id == "a"
+    assert decision.reason == "active"
+    assert decision.chosen_score == 0.0
 
 
 # ───────── decision log ─────────

@@ -27,7 +27,7 @@
 │           │              │              │                │
 │           ▼              ▼              ▼                │
 │    WS operator API   SSH (subprocess)  Gateway runtime   │
-│    中和 SOUL/AGENTS   授权公钥到目标机   drain/warm/activate│
+│    中和 SOUL/AGENTS   授权公钥到目标机   drain/activate      │
 │    引导 Claw 部署                                        │
 └───────┬──────────────────────┬───────────────────────────┘
         │                      │
@@ -298,20 +298,20 @@ _notify_gateway_deploy_done(account)
 _notify_gateway_deploy_failed(account, error)
   → runtime.fail_account_deploy(account, error)
 
-  匹配后端 → mark_failed_rotation（移出路由）
+  匹配后端 → mark_failed_deploy（移出路由）
 ```
 
 ### 5.4 后端生命周期状态机
 
 ```
-active ── prepare_deploy ──▶ draining ──▶ standby
+active ── prepare_deploy ──▶ draining ──▶ inactive
   ▲                              │
   └──── complete_deploy ─────────┘
 ```
 
 - **active**: 唯一可路由后端
 - **draining**: 等 in-flight 完成后移除
-- **standby**: 保留配置但不接新流量
+- **inactive**: 保留配置但不接新流量
 
 ---
 
@@ -397,7 +397,6 @@ Claw 隧道密钥 (~claw/.ssh/id_tunnel):
         "base_url": "http://127.0.0.1:19080",
         "api_key": "",
         "models": ["mimo-v2.5-pro", "mimo-v2-flash"],
-        "weight": 1,
         "account_id": "<account>",
         "enabled": true,
         "lifecycle": "active"

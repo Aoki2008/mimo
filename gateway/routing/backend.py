@@ -7,7 +7,7 @@ from typing import Literal
 
 
 HealthState = Literal["alive", "degraded", "dead", "unknown"]
-LifecycleState = Literal["standby", "warming", "active", "draining", "failed", "disabled"]
+LifecycleState = Literal["inactive", "active", "draining", "failed", "disabled"]
 
 
 @dataclass
@@ -18,10 +18,10 @@ class Backend:
     POSTs ``/v1/chat/completions`` to. ``account_id`` lets the auto-deploy
     pipeline tie a backend back to the Studio account that produced it.
 
-    ``lifecycle`` controls traffic during account handoff:
-    only ``active`` backends can receive new requests. ``draining`` backends
-    keep existing requests alive while the router stops assigning fresh traffic;
-    ``standby`` / ``warming`` are retained as non-routable compatibility states.
+    ``lifecycle`` controls traffic during account handoff: only ``active``
+    backends can receive new requests. ``inactive`` keeps a configured backend
+    available for manual/deploy activation without joining routing, and
+    ``draining`` keeps existing requests alive while new traffic stops.
     """
 
     backend_id: str
@@ -41,15 +41,13 @@ class Backend:
     # Enable/disable (user-controlled, persisted in data/config.json)
     enabled: bool = True
 
-    # Lifecycle / rotation
+    # Lifecycle / deploy handoff
     lifecycle: LifecycleState = "active"
     generation_id: str = ""
     ready_at: float = 0.0
     active_since: float = 0.0
     draining_since: float = 0.0
     drain_deadline: float = 0.0
-    readiness_successes: int = 0
-    readiness_failures: int = 0
     rotation_failures: int = 0
     disabled_until: float = 0.0
 
@@ -63,10 +61,10 @@ class Backend:
 
     # Breaker
     open_until: float = 0.0                  # epoch sec; 0 = closed
-    weight: int = 1                          # static weight for selection
+    weight: int = 1                          # legacy no-op; retained for config compatibility
     metadata: dict[str, str] = field(default_factory=dict)
 
-    # Routing / load balancing
+    # Routing / request accounting
     in_flight: int = 0                       # current concurrent requests
     max_in_flight: int = 50                  # reject new routing when saturated
     ewma_latency_ms: float = 0.0             # exponential moving average
@@ -93,21 +91,11 @@ class Backend:
     def is_temporarily_disabled(self, now: float | None = None) -> bool:
         return (now or time.time()) < self.disabled_until
 
-    def mark_standby(self) -> None:
-        self.lifecycle = "standby"
-        self.draining_since = 0.0
-        self.drain_deadline = 0.0
-        self.readiness_successes = 0
-        self.readiness_failures = 0
-
-    def mark_warming(self, *, now: float | None = None) -> None:
-        self.lifecycle = "warming"
+    def mark_inactive(self) -> None:
+        self.lifecycle = "inactive"
         self.draining_since = 0.0
         self.drain_deadline = 0.0
         self.ready_at = 0.0
-        self.readiness_successes = 0
-        self.readiness_failures = 0
-        self.last_probe_at = now or time.time()
 
     def mark_active(self, *, now: float | None = None) -> None:
         n = now or time.time()
@@ -117,8 +105,6 @@ class Backend:
         self.draining_since = 0.0
         self.drain_deadline = 0.0
         self.disabled_until = 0.0
-        self.readiness_successes = 0
-        self.readiness_failures = 0
         self.reset_breaker()
         if self.health in ("unknown", "dead"):
             self.health = "alive"
@@ -129,7 +115,7 @@ class Backend:
         self.draining_since = n
         self.drain_deadline = n + drain_timeout_s
 
-    def mark_failed_rotation(
+    def mark_failed_deploy(
         self,
         error: str,
         *,
@@ -137,11 +123,17 @@ class Backend:
     ) -> None:
         n = now or time.time()
         self.lifecycle = "failed"
-        self.readiness_failures += 1
         self.rotation_failures += 1
         self.record_failure(error, now=n)
-        # No longer disable — just mark failed. The probe loop
-        # handles detection-zone quarantine separately.
+
+    def mark_failed_rotation(
+        self,
+        error: str,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Compatibility alias for old rotation wording."""
+        self.mark_failed_deploy(error, now=now)
 
     def mark_detection(self, *, now: float | None = None) -> None:
         """Enter detection zone: fast probing (10s) until one success."""
@@ -195,7 +187,7 @@ class Backend:
         cooldown_s: float = 30.0,
         threshold: int = 3,
     ) -> None:
-        """Record a liveness/readiness probe failure separately from traffic."""
+        """Record a liveness probe failure separately from traffic."""
         self.probe_consecutive_failures += 1
         self.record_failure(
             error,
@@ -206,8 +198,8 @@ class Backend:
 
     def status_label(self, now: float | None = None) -> str:
         """A single human-facing status richer than online/offline. Priority
-        order: user disable > draining > rotation-failed > breaker > detection >
-        warming/standby > active health."""
+        order: user disable > draining > deploy-failed > breaker > detection >
+        inactive > active health."""
         n = now or time.time()
         if not self.enabled:
             return "disabled"
@@ -219,10 +211,8 @@ class Backend:
             return "circuit_open"
         if self.in_detection:
             return "detection"
-        if self.lifecycle == "warming":
-            return "warming_ready" if self.readiness_successes > 0 else "warming"
-        if self.lifecycle == "standby":
-            return "standby"
+        if self.lifecycle == "inactive":
+            return "inactive"
         if self.lifecycle == "active":
             if self.health == "dead":
                 return "dead"
@@ -246,7 +236,7 @@ class Backend:
             return False
         return True
 
-    # ───── routing/load balancing helpers ─────
+    # ───── request accounting helpers ─────
 
     def inc_in_flight(self) -> None:
         self.in_flight += 1
@@ -263,17 +253,3 @@ class Backend:
             a = self.latency_alpha
             self.ewma_latency_ms = a * latency_ms + (1 - a) * self.ewma_latency_ms
         self.total_requests += 1
-
-    def routing_score(self) -> float:
-        """Lower is better. Combines latency, current load, and weight.
-
-        Unobserved latency is deliberately conservative for legacy configs
-        that still contain more than one active backend.
-        """
-        base = self.ewma_latency_ms if self.ewma_latency_ms > 0 else 100.0
-        samples = self.total_requests + self.total_failures
-        reliability_penalty = 1.0
-        if samples >= 5 and self.total_failures > 0:
-            failure_rate = self.total_failures / max(samples, 1)
-            reliability_penalty += failure_rate * 4.0
-        return base * (1 + self.in_flight) * reliability_penalty / max(self.weight, 1)

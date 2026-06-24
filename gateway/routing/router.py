@@ -3,9 +3,9 @@ Backend selection + decision logging.
 
 The Router's only job is: given a RequestContext, pick the active backend
 that can serve the requested model. Retry still lives in the handler, which can
-call ``choose`` again after excluding a backend. The gateway now enforces one
-active backend at lifecycle boundaries; scoring remains only as a compatibility
-fallback for legacy multi-active configs.
+call ``choose`` again after excluding a backend. The gateway enforces one active
+backend at lifecycle boundaries, so legacy multi-active configs fall back to the
+first selectable backend in registry order until maintenance drains the extras.
 """
 from __future__ import annotations
 
@@ -108,27 +108,16 @@ class Router:
                 details={"decision": decision.to_dict()},
             )
 
-        # Compatibility fallback for legacy multi-active configs: lower score
-        # wins, then older/less-used backends. Normal operation has one active
-        # backend, so this path is effectively deterministic.
-        chosen = min(
-            candidates,
-            key=lambda b: (
-                b.routing_score(),
-                b.total_requests / max(b.weight, 1),
-                b.last_failure_at,
-                b.backend_id,
-            ),
-        )
+        chosen = candidates[0]
 
         decision = RoutingDecision(
             request_id=request_id,
             model_requested=model,
             chosen_backend=chosen.backend_id,
-            reason="score",
+            reason="active",
             candidates_considered=considered,
             excluded=excluded,
-            chosen_score=round(chosen.routing_score(), 3),
+            chosen_score=0.0,
             chosen_in_flight=chosen.in_flight,
             chosen_latency_ms=round(chosen.ewma_latency_ms, 1),
         )

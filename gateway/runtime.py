@@ -60,20 +60,22 @@ _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
 # Gateway no longer owns account/backend pool rotation. Claw free-tier TTL and
 # account relay are driven by ``claw.claw_activity``; the gateway keeps one
 # active backend and only performs health/model maintenance.
-_ROTATION_INTERVAL_S = 0.0
 _DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
 _DEPLOY_DRAIN_GRACE_S = _env_float("GATEWAY_DEPLOY_DRAIN_GRACE_S", 20.0)
 _DETECTION_ZONE_FAILURES = 2           # consecutive failures to enter detection
 _DETECTION_PROBE_INTERVAL_S = 10.0      # fast probe interval in detection zone
-_ROTATION_LOOP_INTERVAL_S = _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0)
+_MAINTENANCE_LOOP_INTERVAL_S = _env_float(
+    "GATEWAY_MAINTENANCE_LOOP_INTERVAL_S",
+    _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0),
+)
 # How often to re-sync each backend's model list from its /v1/models.
 _MODEL_SYNC_INTERVAL_S = _env_float("GATEWAY_MODEL_SYNC_INTERVAL_S", 300.0)
 
-_READINESS_PROMPT = "ping"
+_PROBE_PROMPT = "ping"
 
 # Models that cannot answer a text /v1/chat/completions probe (text-to-speech,
 # speech recognition). Probing them would falsely mark a healthy backend dead,
-# so they are excluded from liveness/readiness probing.
+# so they are excluded from liveness probing.
 _NON_CHAT_MODEL_RE = re.compile(r"(tts|asr)", re.IGNORECASE)
 
 
@@ -91,7 +93,7 @@ _handler: GatewayHandler | None = None
 _decision_log: InMemoryDecisionLog | None = None
 _adapters: dict[str, ProtocolAdapter] = {}
 _probe_task: asyncio.Task | None = None
-_rotation_task: asyncio.Task | None = None
+_maintenance_task: asyncio.Task | None = None
 _started_at: float = time.time()
 _total_requests: int = 0
 
@@ -108,8 +110,10 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
     models = entry.get("models") or []
     if not isinstance(models, list):
         models = []
-    lifecycle = entry.get("lifecycle") or "active"
-    if lifecycle not in {"standby", "warming", "active", "draining", "failed", "disabled"}:
+    lifecycle = str(entry.get("lifecycle") or "active")
+    if lifecycle in {"standby", "warming"}:
+        lifecycle = "inactive"
+    if lifecycle not in {"inactive", "active", "draining", "failed", "disabled"}:
         lifecycle = "active"
     backend = Backend(
         backend_id=entry["id"],
@@ -184,7 +188,7 @@ def reload_backends() -> int:
     Existing Backend objects keep EWMA, breaker, and in-flight state. Removed
     backends are marked draining instead of being dropped while requests are in
     flight. Legacy configs with several active backends are collapsed to one
-    active backend; extra active entries are drained/standby instead of routed.
+    active backend; extra active entries are drained and then become inactive.
     """
     _ensure_initialized()
     assert _registry is not None
@@ -196,9 +200,7 @@ def reload_backends() -> int:
         seen.add(fresh.backend_id)
         existing = _registry.get(fresh.backend_id)
         if existing is None:
-            if fresh.lifecycle == "active" or (
-                fresh.lifecycle == "warming" and not _has_active_backend()
-            ):
+            if fresh.lifecycle == "active":
                 fresh.mark_active(now=now)
             _registry.add(fresh)
             continue
@@ -216,8 +218,8 @@ def reload_backends() -> int:
         existing.in_detection = fresh.in_detection
         existing.detection_entered_at = fresh.detection_entered_at
         if fresh.lifecycle != existing.lifecycle:
-            if fresh.lifecycle == "warming":
-                existing.mark_warming(now=now)
+            if fresh.lifecycle == "inactive":
+                existing.mark_inactive()
             elif fresh.lifecycle == "active":
                 existing.mark_active(now=now)
             elif fresh.lifecycle == "draining":
@@ -238,15 +240,6 @@ def reload_backends() -> int:
     return len(_registry.all())
 
 
-def _has_active_backend() -> bool:
-    assert _registry is not None
-    return any(
-        b.enabled
-        and b.lifecycle == "active"
-        for b in _registry.all()
-    )
-
-
 def _enforce_single_active_backend(*, preferred: Backend | None = None) -> list[str]:
     """Keep only one active backend in the gateway data plane.
 
@@ -261,10 +254,7 @@ def _enforce_single_active_backend(*, preferred: Backend | None = None) -> list[
     ]
     if not active:
         return []
-    keep = preferred if any(b is preferred for b in active) else max(
-        active,
-        key=lambda b: (b.active_since or 0.0, b.backend_id),
-    )
+    keep = preferred if any(b is preferred for b in active) else active[0]
     return _retire_other_backends(keep)
 
 
@@ -278,8 +268,6 @@ def _retire_other_backends(active_backend: Backend) -> list[str]:
             continue
         if backend.lifecycle == "active" or backend.in_flight > 0:
             backend.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
-        elif backend.lifecycle == "warming":
-            backend.mark_standby()
         else:
             continue
         _persist_backend_runtime_state(backend)
@@ -355,24 +343,21 @@ def get_router_status() -> dict[str, Any]:
     latencies = [b.ewma_latency_ms for b in backends if b.ewma_latency_ms > 0]
     avg_lat = round(sum(latencies) / len(latencies), 1) if latencies else 0
     uptime = int(time.time() - _started_at)
+    active_backend = next((b.backend_id for b in backends if b.lifecycle == "active"), "")
     return {
         "uptime": uptime,
         "total_requests": _total_requests,
         "qps": round(_total_requests / max(uptime, 1), 2),
         "avg_latency_ms": avg_lat,
+        "active_backend": active_backend,
         "backends_total": len(backends),
         "backends_healthy": healthy,
         "backends_active": sum(1 for b in backends if b.lifecycle == "active"),
-        "backends_standby": sum(1 for b in backends if b.lifecycle == "standby"),
-        "backends_warming": sum(1 for b in backends if b.lifecycle == "warming"),
+        "backends_inactive": sum(1 for b in backends if b.lifecycle == "inactive"),
         "backends_draining": sum(1 for b in backends if b.lifecycle == "draining"),
         "backends_failed": sum(1 for b in backends if b.lifecycle == "failed"),
         "backends_detection": sum(1 for b in backends if b.in_detection),
         "backends_degraded": sum(1 for b in backends if b.lifecycle == "active" and b.health == "degraded"),
-        "rotation_interval_s": int(_ROTATION_INTERVAL_S),
-        "pool_idle": 0,
-        "pool_active": 0,
-        "pool_reuse_rate": 0,
     }
 
 
@@ -389,7 +374,6 @@ def get_all_backends() -> list[dict[str, Any]]:
             "models": list(b.models),
             "healthy": b.is_selectable(now),
             "status": b.status_label(now),
-            "weight": b.weight,
             "avg_latency_ms": round(b.ewma_latency_ms, 1),
             "p95_latency_ms": round(b.ewma_latency_ms, 1),
             "circuit": "open" if b.is_open(now) else b.health,
@@ -402,8 +386,6 @@ def get_all_backends() -> list[dict[str, Any]]:
             "active_for_s": round(now - b.active_since, 1) if b.active_since else 0,
             "draining_for_s": round(now - b.draining_since, 1) if b.draining_since else 0,
             "drain_deadline_s": round(b.drain_deadline - now, 1) if b.drain_deadline else 0,
-            "readiness_successes": b.readiness_successes,
-            "readiness_failures": b.readiness_failures,
             "rotation_failures": b.rotation_failures,
             "disabled_until": b.disabled_until,
         })
@@ -427,16 +409,17 @@ def toggle_backend(backend_id: str) -> dict[str, Any]:
         b.disabled_until = 0.0
         b.in_detection = False
         b.detection_entered_at = 0.0
-        if b.lifecycle in ("disabled", "failed"):
-            b.mark_warming()
+        retired = _activate_backend(b, reason="toggle")
     else:
+        retired = []
         b.lifecycle = "disabled"
+        _persist_backend_runtime_state(b)
 
     from gateway.backend_store import update_backend
     update_backend(backend_id, enabled=new_enabled, lifecycle=b.lifecycle, disabled_until=b.disabled_until)
 
     label = "启用" if new_enabled else "禁用"
-    return {"success": True, "message": f"Backend {backend_id!r} {label}"}
+    return {"success": True, "message": f"Backend {backend_id!r} {label}", "retired": retired}
 
 
 def activate_backend(backend_id: str) -> dict[str, Any]:
@@ -502,7 +485,7 @@ def wait_for_account_drain(
 
 
 def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> dict[str, Any]:
-    """Reload and warm/activate backends that belong to a freshly deployed Claw."""
+    """Reload and activate backends that belong to a freshly deployed Claw."""
     reload_backends()
     assert _registry is not None
     now = time.time()
@@ -538,10 +521,50 @@ def fail_account_deploy(account_id: str, *, api_port: int | None = None, error: 
     targets = _matching_account_backends(account_id, api_port=api_port)
     failed: list[str] = []
     for backend in targets:
-        backend.mark_failed_rotation(error)
+        backend.mark_failed_deploy(error)
         _persist_backend_runtime_state(backend)
         failed.append(backend.backend_id)
     return {"success": True, "account": account_id, "matched": [b.backend_id for b in targets], "failed": failed}
+
+
+def abort_account_deploy(
+    account_id: str,
+    *,
+    api_port: int | None = None,
+    restore: bool,
+    error: str = "deploy aborted",
+) -> dict[str, Any]:
+    """Resolve a deploy that stopped after prepare but before completion.
+
+    ``restore=True`` is used only while the old Claw/tunnel is known untouched;
+    otherwise the matched backend is marked failed so the gateway does not route
+    to an uncertain upstream.
+    """
+    _ensure_initialized()
+    assert _registry is not None
+    targets = _matching_account_backends(account_id, api_port=api_port)
+    restored: list[str] = []
+    failed: list[str] = []
+    for backend in targets:
+        if restore and backend.lifecycle in {"draining", "inactive"}:
+            backend.enabled = True
+            backend.reset_breaker()
+            backend.health = "alive"
+            backend.consecutive_failures = 0
+            backend.last_error = ""
+            _activate_backend(backend, reason="deploy_abort")
+            restored.append(backend.backend_id)
+        else:
+            backend.mark_failed_deploy(error)
+            _persist_backend_runtime_state(backend)
+            failed.append(backend.backend_id)
+    return {
+        "success": True,
+        "account": account_id,
+        "matched": [b.backend_id for b in targets],
+        "restored": restored,
+        "failed": failed,
+    }
 
 
 def _matching_account_backends(account_id: str, *, api_port: int | None = None) -> list[Backend]:
@@ -591,14 +614,14 @@ async def _probe_loop() -> None:
 
     async def _probe_one(backend: Backend, semaphore: asyncio.Semaphore) -> None:
         async with semaphore:
-            if not backend.enabled:
+            if not backend.enabled or backend.lifecycle != "active":
                 return
             # Probe ONE model chosen from the backend's own (non-tts/asr) model
             # list — not a hardcoded model, and not every model.
             started = time.monotonic()
             try:
-                body = _readiness_non_stream_body(backend)
-                ok, reason = await _run_one_readiness_check(backend, "probe", body)
+                body = _probe_non_stream_body(backend)
+                ok, reason = await _run_one_probe_check(backend, "probe", body)
             except Exception as e:  # noqa: BLE001
                 ok = False
                 reason = f"{type(e).__name__}: {e}"
@@ -609,9 +632,6 @@ async def _probe_loop() -> None:
                 if backend.in_detection:
                     backend.exit_detection()
                     logger.info("Backend %s exited detection zone (healthy)", backend.backend_id)
-                if backend.lifecycle == "failed":
-                    backend.mark_standby()
-                    logger.info("Backend %s recovered from failed → standby", backend.backend_id)
                 return
 
             backend.record_probe_failure(
@@ -629,7 +649,10 @@ async def _probe_loop() -> None:
 
     while True:
         try:
-            enabled_backends = [b for b in _registry.all() if b.enabled]
+            enabled_backends = [
+                b for b in _registry.all()
+                if b.enabled and b.lifecycle == "active"
+            ]
             semaphore = asyncio.Semaphore(_PROBE_CONCURRENCY)
             await asyncio.gather(
                 *(_probe_one(b, semaphore) for b in enabled_backends),
@@ -646,7 +669,7 @@ async def _probe_loop() -> None:
         await asyncio.sleep(interval)
 
 
-async def _rotation_loop() -> None:
+async def _maintenance_loop() -> None:
     """Run lightweight backend maintenance for single-active mode."""
     _ensure_initialized()
     assert _registry is not None
@@ -656,8 +679,8 @@ async def _rotation_loop() -> None:
             _enforce_single_active_backend()
             _reap_drained()
         except Exception:  # noqa: BLE001
-            logger.exception("Gateway rotation loop failed")
-        await asyncio.sleep(_ROTATION_LOOP_INTERVAL_S)
+            logger.exception("Gateway maintenance loop failed")
+        await asyncio.sleep(_MAINTENANCE_LOOP_INTERVAL_S)
 
 
 def _fetch_models_for(base_url: str, api_key: str = "") -> list[str] | None:
@@ -693,7 +716,7 @@ async def _sync_backend_models() -> None:
     assert _registry is not None
     now = time.time()
     for b in _registry.all():
-        if not b.enabled:
+        if not b.enabled or b.lifecycle != "active":
             continue
         if now - b.last_model_sync_at < _MODEL_SYNC_INTERVAL_S:
             continue
@@ -718,6 +741,7 @@ async def _sync_backend_models() -> None:
 def _activate_backend(backend: Backend, *, reason: str) -> list[str]:
     """Make ``backend`` the single active backend."""
     now = time.time()
+    backend.enabled = True
     backend.mark_active(now=now)
     shared_models = set(backend.models)
     _persist_backend_runtime_state(backend)
@@ -749,7 +773,7 @@ def _reap_drained(*, now: float | None = None) -> None:
                 b.in_flight,
             )
         if b.backend_id in persisted_ids:
-            b.mark_standby()
+            b.mark_inactive()
             _persist_backend_runtime_state(b)
         else:
             _registry.remove(b.backend_id)
@@ -762,7 +786,7 @@ def _persisted_backend_ids() -> set[str]:
         return set()
 
 
-async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, Any]) -> tuple[bool, str]:
+async def _run_one_probe_check(backend: Backend, name: str, body: dict[str, Any]) -> tuple[bool, str]:
     assert _transport is not None
     proxy_url = None
     url = backend.base_url.rstrip("/") + "/v1/chat/completions"
@@ -781,21 +805,21 @@ async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, 
         return False, f"{type(e).__name__}: {e}"
 
 
-def _readiness_model(backend: Backend) -> str:
+def _probe_model(backend: Backend) -> str:
     if not backend.models:
         raise ValueError("backend has no configured models for probe checks")
     probeable = _probeable_models(backend)
     return probeable[0] if probeable else backend.models[0]
 
 
-def _readiness_non_stream_body(backend: Backend) -> dict[str, Any]:
-    return _readiness_body_for_model(_readiness_model(backend))
+def _probe_non_stream_body(backend: Backend) -> dict[str, Any]:
+    return _probe_body_for_model(_probe_model(backend))
 
 
-def _readiness_body_for_model(model: str) -> dict[str, Any]:
+def _probe_body_for_model(model: str) -> dict[str, Any]:
     return {
         "model": model,
-        "messages": [{"role": "user", "content": _READINESS_PROMPT}],
+        "messages": [{"role": "user", "content": _PROBE_PROMPT}],
         "max_tokens": 256,
         "stream": False,
     }
@@ -819,8 +843,8 @@ def _persist_backend_runtime_state(backend: Backend) -> None:
 
 
 def start_probe() -> None:
-    """Idempotent. Spawns background liveness and rotation tasks."""
-    global _probe_task, _rotation_task
+    """Idempotent. Spawns background liveness and maintenance tasks."""
+    global _probe_task, _maintenance_task
     _ensure_initialized()
     try:
         loop = asyncio.get_running_loop()
@@ -828,16 +852,16 @@ def start_probe() -> None:
         return
     if _probe_task is None or _probe_task.done():
         _probe_task = loop.create_task(_probe_loop())
-    if _rotation_task is None or _rotation_task.done():
-        _rotation_task = loop.create_task(_rotation_loop())
+    if _maintenance_task is None or _maintenance_task.done():
+        _maintenance_task = loop.create_task(_maintenance_loop())
 
 
 async def shutdown() -> None:
     """Close runtime-owned background resources."""
-    global _probe_task, _rotation_task
-    tasks = (_probe_task, _rotation_task)
+    global _probe_task, _maintenance_task
+    tasks = (_probe_task, _maintenance_task)
     _probe_task = None
-    _rotation_task = None
+    _maintenance_task = None
     for task in tasks:
         if task is None:
             continue
@@ -959,6 +983,7 @@ __all__ = [
     "wait_for_account_drain",
     "complete_account_deploy",
     "fail_account_deploy",
+    "abort_account_deploy",
     "start_probe",
     "shutdown",
 ]

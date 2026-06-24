@@ -127,6 +127,29 @@ def _notify_gateway_deploy_failed(account_filename: str, error: str, log: "Deplo
         log.log(f"Gateway 已暂时移除失败的部署后端: {', '.join(failed)}")
 
 
+def _notify_gateway_deploy_aborted(
+    account_filename: str,
+    *,
+    restore: bool,
+    error: str,
+    log: "DeployLogger",
+) -> None:
+    """Resolve a cancelled deployment after the gateway prepare hook ran."""
+    try:
+        from gateway.runtime import abort_account_deploy
+        result = abort_account_deploy(account_filename, restore=restore, error=error)
+    except Exception as e:  # noqa: BLE001
+        log.log(f"⚠️ Gateway 取消状态同步失败: {type(e).__name__}: {e}")
+        logger_module.exception("Gateway deploy-abort hook failed for %s", account_filename)
+        return
+    restored = result.get("restored") or []
+    failed = result.get("failed") or []
+    if restored:
+        log.log(f"Gateway 已恢复取消前的后端: {', '.join(restored)}")
+    if failed:
+        log.log(f"Gateway 已移除取消后状态不明的后端: {', '.join(failed)}")
+
+
 # Stale-deploy entries (state ∈ done/error/cancelled) older than this are
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
 _STALE_AFTER_S = 300
@@ -515,6 +538,7 @@ def _load_rotation_status(cfg: dict) -> dict:
             "selectable_backend_count": len(selectable),
             "age_s": int(age_s),
             "age_min": round(age_s / 60.0, 1) if age_s else 0,
+            "next_relay_reason": reason,
             "next_rotation_reason": reason,
             "skip_reason": "" if selectable else ("no_selectable_backend" if matches else "skipped_unmatched"),
         }
@@ -826,6 +850,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
     log = DeployLogger(account_filename)
     cancel_event = threading.Event()
     gateway_prepared = False
+    gateway_restore_safe = False
 
     _active_deploys[account_filename] = {
         "thread": threading.current_thread(),
@@ -843,6 +868,13 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
     def mark_finished(state: str, history_status: str | None = None) -> None:
         if history_status == "error" and gateway_prepared:
             _notify_gateway_deploy_failed(account_filename, state, log)
+        elif history_status == "cancelled" and gateway_prepared:
+            _notify_gateway_deploy_aborted(
+                account_filename,
+                restore=gateway_restore_safe,
+                error=state,
+                log=log,
+            )
         set_state(state)
         _active_deploys[account_filename]["finished_ts"] = time.time()
         if history_status is not None:
@@ -897,6 +929,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
 
         _notify_gateway_deploy_start(account_filename, log)
         gateway_prepared = True
+        gateway_restore_safe = True
 
         # Step 0: Destroy existing claw if any.
         set_state("step0_destroy")
@@ -918,6 +951,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             log.log("[reuse] existing claw is AVAILABLE and force=False; skip destroy/create")
         elif has_claw:
             log.log("\u53d1\u73b0\u65e7 Claw\uff0c\u9500\u6bc1\u4e2d...")
+            gateway_restore_safe = False
             await acurl("POST", "/open-apis/user/mimo-claw/destroy", body={}, cookies=cookies)
             for _ in range(_DESTROY_POLL_MAX_ITERS):
                 if cancelled():
@@ -1218,6 +1252,7 @@ def get_scheduler_status() -> dict:
                 "enabled": False,
                 "age_s": 0,
                 "age_min": 0,
+                "next_relay_reason": "disabled",
                 "next_rotation_reason": "disabled",
                 "skip_reason": "disabled",
             }
@@ -1234,7 +1269,7 @@ def get_scheduler_status() -> dict:
 
     return {
         "scheduler_running": False,
-        "schedule_mode": "expiry_rotation",
+        "schedule_mode": "expiry_relay",
         "policy": rotation.get("policy", {}),
         "counts": rotation.get("counts", {}),
         "accounts": schedule_info,
