@@ -57,17 +57,14 @@ _PROBE_CONCURRENCY = 10
 _DEFAULT_REQUEST_TIMEOUT_S = 600.0
 _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
 
-# Gateway no longer owns account/backend pool rotation. Claw free-tier TTL and
+# Gateway no longer owns account/backend relay policy. Claw free-tier TTL and
 # account relay are driven by ``claw.claw_activity``; the gateway keeps one
 # active backend and only performs health/model maintenance.
 _DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
 _DEPLOY_DRAIN_GRACE_S = _env_float("GATEWAY_DEPLOY_DRAIN_GRACE_S", 20.0)
 _DETECTION_ZONE_FAILURES = 2           # consecutive failures to enter detection
 _DETECTION_PROBE_INTERVAL_S = 10.0      # fast probe interval in detection zone
-_MAINTENANCE_LOOP_INTERVAL_S = _env_float(
-    "GATEWAY_MAINTENANCE_LOOP_INTERVAL_S",
-    _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0),
-)
+_MAINTENANCE_LOOP_INTERVAL_S = _env_float("GATEWAY_MAINTENANCE_LOOP_INTERVAL_S", 60.0)
 # How often to re-sync each backend's model list from its /v1/models.
 _MODEL_SYNC_INTERVAL_S = _env_float("GATEWAY_MODEL_SYNC_INTERVAL_S", 300.0)
 
@@ -121,12 +118,10 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
         models=[m for m in models if isinstance(m, str) and m],
         account_id=entry.get("account_id") or "",
         api_key=api_key,
-        weight=max(1, int(entry.get("weight") or 1)),
         enabled=bool(entry.get("enabled", True)),
         metadata=meta,
         lifecycle=lifecycle,
         generation_id=entry.get("generation_id") or entry.get("id") or "",
-        rotation_failures=max(0, int(entry.get("rotation_failures") or 0)),
         disabled_until=float(entry.get("disabled_until") or 0.0),
         in_detection=bool(entry.get("in_detection", False)),
         detection_entered_at=float(entry.get("detection_entered_at") or 0.0),
@@ -209,11 +204,9 @@ def reload_backends() -> int:
         existing.models = fresh.models
         existing.account_id = fresh.account_id
         existing.api_key = fresh.api_key
-        existing.weight = fresh.weight
         existing.enabled = fresh.enabled
         existing.metadata = fresh.metadata
         existing.generation_id = fresh.generation_id
-        existing.rotation_failures = fresh.rotation_failures
         existing.disabled_until = fresh.disabled_until
         existing.in_detection = fresh.in_detection
         existing.detection_entered_at = fresh.detection_entered_at
@@ -243,8 +236,8 @@ def reload_backends() -> int:
 def _enforce_single_active_backend(*, preferred: Backend | None = None) -> list[str]:
     """Keep only one active backend in the gateway data plane.
 
-    Older configs may still contain several active entries from the previous
-    pool model. Preserve the preferred/current active backend and retire the
+    Older configs may still contain several active entries. Preserve the
+    preferred/current active backend and retire the
     rest so the router sees a single account at a time.
     """
     assert _registry is not None
@@ -386,7 +379,6 @@ def get_all_backends() -> list[dict[str, Any]]:
             "active_for_s": round(now - b.active_since, 1) if b.active_since else 0,
             "draining_for_s": round(now - b.draining_since, 1) if b.draining_since else 0,
             "drain_deadline_s": round(b.drain_deadline - now, 1) if b.drain_deadline else 0,
-            "rotation_failures": b.rotation_failures,
             "disabled_until": b.disabled_until,
         })
     return out
@@ -490,7 +482,6 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
     assert _registry is not None
     now = time.time()
     targets = _matching_account_backends(account_id, api_port=api_port)
-    warmed: list[str] = []
     activated: list[str] = []
     retired: list[str] = []
     for backend in targets:
@@ -508,7 +499,6 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
         "success": True,
         "account": account_id,
         "matched": [b.backend_id for b in targets],
-        "warmed": warmed,
         "activated": activated,
         "retired": retired,
     }
@@ -833,7 +823,6 @@ def _persist_backend_runtime_state(backend: Backend) -> None:
             enabled=backend.enabled,
             lifecycle=backend.lifecycle,
             generation_id=backend.generation_id,
-            rotation_failures=backend.rotation_failures,
             disabled_until=backend.disabled_until,
             in_detection=backend.in_detection,
             detection_entered_at=backend.detection_entered_at,

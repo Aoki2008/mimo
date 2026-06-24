@@ -3,9 +3,6 @@
 Each entry is a dict with:
   id, name, base_url, models (list[str]), api_key, enabled, account_id
 
-Legacy ``weight`` values are still accepted/read so old config files migrate
-cleanly, but single-active routing no longer uses weighted selection.
-
 Legacy format with ``model`` (str) + ``aliases`` (comma-string) is migrated
 to ``models`` on read; written entries always use the new shape.
 
@@ -59,6 +56,8 @@ def _normalize_lifecycle(raw: Any) -> str:
 def _migrate_entry(entry: dict) -> dict:
     """If entry uses legacy {model, aliases}, fold them into models[]."""
     entry["lifecycle"] = _normalize_lifecycle(entry.get("lifecycle"))
+    entry.pop("weight", None)
+    entry.pop("rotation_failures", None)
     if "models" in entry and isinstance(entry["models"], list):
         entry["models"] = _normalize_models(entry["models"])
         entry.pop("model", None)
@@ -103,7 +102,6 @@ def add_backend(
     base_url: str,
     models: Any = None,
     api_key: str = "",
-    weight: int = 1,
     account_id: str = "",
     # legacy kwargs accepted for callers that still pass model/aliases
     model: str = "",
@@ -134,7 +132,6 @@ def add_backend(
         "base_url": base_url,
         "models": model_list,
         "api_key": api_key,
-        "weight": max(1, int(weight)),
         "account_id": account_id,
         "enabled": True,
         "lifecycle": "active",
@@ -181,9 +178,9 @@ def upsert_account_backend(
 
 
 def update_backend(backend_id: str, **fields: Any) -> dict[str, Any] | None:
-    allowed = {"name", "base_url", "models", "api_key", "weight",
+    allowed = {"name", "base_url", "models", "api_key",
                "account_id", "enabled", "lifecycle", "generation_id",
-               "rotation_failures", "disabled_until",
+               "disabled_until",
                "in_detection", "detection_entered_at"}
     # Legacy: caller passes {model, aliases} — fold into models.
     if "model" in fields or "aliases" in fields:

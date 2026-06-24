@@ -1491,12 +1491,12 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     var schedInfo = (scheduler.accounts && scheduler.accounts[fn]) || {};
     var lastRun = schedInfo.last_run || (cfg.last_run ? new Date(cfg.last_run * 1000).toLocaleString('zh-CN') : '从未');
     var ageMin = schedInfo.age_min || 0;
-    var rotReason = schedInfo.next_relay_reason || schedInfo.next_rotation_reason || '';
+    var relayReason = schedInfo.next_relay_reason || '';
     var skipReason = schedInfo.skip_reason || '';
     html += '<div style="display:flex;gap:20px;margin-bottom:10px;font-size:0.78rem;color:var(--text3)">';
     html += '<span>上次：<b style="color:var(--text2)">' + escapeHtml(String(lastRun)) + '</b></span>';
     if (ageMin > 0) html += '<span>年龄：<b style="color:' + (ageMin >= 230 ? 'var(--red)' : ageMin >= 210 ? 'var(--yellow)' : 'var(--text2)') + '">' + ageMin + ' 分钟</b></span>';
-    if (rotReason && rotReason !== 'fresh' && rotReason !== 'disabled') html += '<span>接力原因：<b>' + escapeHtml(rotReason) + '</b></span>';
+    if (relayReason && relayReason !== 'fresh' && relayReason !== 'disabled') html += '<span>接力原因：<b>' + escapeHtml(relayReason) + '</b></span>';
     if (skipReason && skipReason !== 'disabled') html += '<span style="color:var(--yellow)">跳过：' + escapeHtml(skipReason) + '</span>';
     html += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
     html += '</div>';

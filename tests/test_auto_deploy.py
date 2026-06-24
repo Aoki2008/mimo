@@ -2,8 +2,8 @@ from claw.auto_deploy import (
     _is_retryable_create_429,
     _parse_ssh_pubkey,
     _render_ssh_payload,
-    _rotation_policy,
-    _rotation_reason,
+    _relay_policy,
+    _relay_reason,
     _REVERSE_TUNNEL_SH,
 )
 
@@ -61,21 +61,21 @@ def test_render_ssh_payload_substitutes_target_placeholders():
     assert 'TARGET_USER="tunnel"' in rendered
 
 
-def test_rotation_policy_targets_single_active_backend():
-    assert _rotation_policy(0) == {
+def test_relay_policy_targets_single_active_backend():
+    assert _relay_policy(0) == {
         "desired_active": 0,
         "normal_min_active": 0,
         "emergency_min_active": 0,
     }
-    assert _rotation_policy(5) == {
+    assert _relay_policy(5) == {
         "desired_active": 1,
         "normal_min_active": 1,
         "emergency_min_active": 1,
     }
 
 
-def test_rotation_reason_uses_four_hour_ttl_window():
-    assert _rotation_reason((3 * 60 * 60) + (29 * 60)) == "fresh"
-    assert _rotation_reason((3 * 60 * 60) + (30 * 60)) == "target_age"
-    assert _rotation_reason((3 * 60 * 60) + (50 * 60)) == "critical_age"
-    assert _rotation_reason(4 * 60 * 60) == "hard_expiry_age"
+def test_relay_reason_uses_four_hour_ttl_window():
+    assert _relay_reason((3 * 60 * 60) + (29 * 60)) == "fresh"
+    assert _relay_reason((3 * 60 * 60) + (30 * 60)) == "target_age"
+    assert _relay_reason((3 * 60 * 60) + (50 * 60)) == "critical_age"
+    assert _relay_reason(4 * 60 * 60) == "hard_expiry_age"

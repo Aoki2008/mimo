@@ -1,4 +1,4 @@
-"""Routing: backend pool, selection, health probing, decision log."""
+"""Routing: active backend selection, health probing, decision log."""
 from .backend import Backend, HealthState
 from .decision_log import (
     DecisionLogWriter,

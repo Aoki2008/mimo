@@ -103,10 +103,7 @@ def _notify_gateway_deploy_done(account_filename: str, log: "DeployLogger") -> N
         logger_module.exception("Gateway deploy-done hook failed for %s", account_filename)
         return
     matched = result.get("matched") or []
-    warmed = result.get("warmed") or []
     activated = result.get("activated") or []
-    if warmed:
-        log.log(f"Gateway 已重载并保留新 Claw 后端为待激活状态: {', '.join(warmed)}")
     if activated:
         log.log(f"Gateway 已重载并激活新 Claw 后端: {', '.join(activated)}")
     if not matched:
@@ -157,9 +154,9 @@ _STALE_AFTER_S = 300
 # MiMo free-tier Claws are reclaimed at roughly 4h. Status reporting mirrors
 # the activity loop relay window: start preparing around 30 minutes before TTL,
 # treat the last 10 minutes as critical, and hard-expire at 4h.
-_ROTATION_TARGET_AGE_S = 3 * 60 * 60 + 30 * 60
-_ROTATION_CRITICAL_AGE_S = 3 * 60 * 60 + 50 * 60
-_ROTATION_HARD_EXPIRY_AGE_S = 4 * 60 * 60
+_RELAY_TARGET_AGE_S = 3 * 60 * 60 + 30 * 60
+_RELAY_CRITICAL_AGE_S = 3 * 60 * 60 + 50 * 60
+_RELAY_HARD_EXPIRY_AGE_S = 4 * 60 * 60
 
 # Per-step timing knobs.
 _DESTROY_POLL_INTERVAL_S = 5
@@ -465,9 +462,9 @@ def _gc_active_deploys() -> None:
         _active_deploys.pop(acc, None)
 
 
-# ─── Rotation status helpers (read-only) ───
+# ─── Relay status helpers (read-only) ───
 
-def _rotation_policy(enabled_count: int) -> dict:
+def _relay_policy(enabled_count: int) -> dict:
     enabled = max(0, int(enabled_count or 0))
     if enabled <= 0:
         return {"desired_active": 0, "normal_min_active": 0, "emergency_min_active": 0}
@@ -478,25 +475,25 @@ def _rotation_policy(enabled_count: int) -> dict:
     }
 
 
-def _rotation_reason(age_s: float) -> str:
-    if age_s >= _ROTATION_HARD_EXPIRY_AGE_S:
+def _relay_reason(age_s: float) -> str:
+    if age_s >= _RELAY_HARD_EXPIRY_AGE_S:
         return "hard_expiry_age"
-    if age_s >= _ROTATION_CRITICAL_AGE_S:
+    if age_s >= _RELAY_CRITICAL_AGE_S:
         return "critical_age"
-    if age_s >= _ROTATION_TARGET_AGE_S:
+    if age_s >= _RELAY_TARGET_AGE_S:
         return "target_age"
     return "fresh"
 
 
-def _load_rotation_status(cfg: dict) -> dict:
-    """Compute per-account rotation status from gateway backends (read-only)."""
+def _load_relay_status(cfg: dict) -> dict:
+    """Compute per-account relay status from gateway backends (read-only)."""
     accounts_cfg = cfg.get("accounts", {}) or {}
     enabled_accounts = [
         acc for acc, acc_cfg in accounts_cfg.items()
         if acc_cfg.get("enabled", False)
     ]
     enabled_count = len(enabled_accounts)
-    policy = _rotation_policy(enabled_count)
+    policy = _relay_policy(enabled_count)
 
     backends: list[dict] = []
     try:
@@ -530,7 +527,7 @@ def _load_rotation_status(cfg: dict) -> dict:
             if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") == "active"
         ]
         age_s = max((float(b.get("active_for_s") or 0) for b in selectable), default=0.0)
-        reason = _rotation_reason(age_s)
+        reason = _relay_reason(age_s)
         status = {
             "enabled": True,
             "active": bool(selectable),
@@ -539,7 +536,6 @@ def _load_rotation_status(cfg: dict) -> dict:
             "age_s": int(age_s),
             "age_min": round(age_s / 60.0, 1) if age_s else 0,
             "next_relay_reason": reason,
-            "next_rotation_reason": reason,
             "skip_reason": "" if selectable else ("no_selectable_backend" if matches else "skipped_unmatched"),
         }
         account_status[account] = status
@@ -1242,18 +1238,17 @@ def get_scheduler_status() -> dict:
     cfg = load_config()
     accounts = cfg.get("accounts", {})
     schedule_info = {}
-    rotation = _load_rotation_status(cfg)
-    rotation_accounts = rotation.get("accounts") or {}
+    relay = _load_relay_status(cfg)
+    relay_accounts = relay.get("accounts") or {}
 
     for acc_filename, acc_cfg in accounts.items():
-        rotation_info = rotation_accounts.get(acc_filename, {})
+        relay_info = relay_accounts.get(acc_filename, {})
         if not acc_cfg.get("enabled", False):
             schedule_info[acc_filename] = {
                 "enabled": False,
                 "age_s": 0,
                 "age_min": 0,
                 "next_relay_reason": "disabled",
-                "next_rotation_reason": "disabled",
                 "skip_reason": "disabled",
             }
             continue
@@ -1264,13 +1259,13 @@ def get_scheduler_status() -> dict:
                 datetime.fromtimestamp(last_run).strftime("%Y-%m-%d %H:%M")
                 if last_run else "从未运行"
             ),
-            **rotation_info,
+            **relay_info,
         }
 
     return {
         "scheduler_running": False,
         "schedule_mode": "expiry_relay",
-        "policy": rotation.get("policy", {}),
-        "counts": rotation.get("counts", {}),
+        "policy": relay.get("policy", {}),
+        "counts": relay.get("counts", {}),
         "accounts": schedule_info,
     }

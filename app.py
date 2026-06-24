@@ -1973,7 +1973,6 @@ async def gateway_backend_add(request: Request):
             models=body.get("models") if body.get("models") is not None else body.get("model", ""),
             api_key=body.get("api_key", ""),
             aliases=body.get("aliases", ""),
-            weight=body.get("weight", 1),
             account_id=body.get("account_id", ""),
         )
         reload_backends()

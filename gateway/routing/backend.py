@@ -48,7 +48,6 @@ class Backend:
     active_since: float = 0.0
     draining_since: float = 0.0
     drain_deadline: float = 0.0
-    rotation_failures: int = 0
     disabled_until: float = 0.0
 
     # Detection zone — fast-probe quarantine for flaky backends
@@ -61,7 +60,6 @@ class Backend:
 
     # Breaker
     open_until: float = 0.0                  # epoch sec; 0 = closed
-    weight: int = 1                          # legacy no-op; retained for config compatibility
     metadata: dict[str, str] = field(default_factory=dict)
 
     # Routing / request accounting
@@ -123,17 +121,7 @@ class Backend:
     ) -> None:
         n = now or time.time()
         self.lifecycle = "failed"
-        self.rotation_failures += 1
         self.record_failure(error, now=n)
-
-    def mark_failed_rotation(
-        self,
-        error: str,
-        *,
-        now: float | None = None,
-    ) -> None:
-        """Compatibility alias for old rotation wording."""
-        self.mark_failed_deploy(error, now=now)
 
     def mark_detection(self, *, now: float | None = None) -> None:
         """Enter detection zone: fast probing (10s) until one success."""

@@ -208,7 +208,6 @@ def test_router_uses_registry_order_for_legacy_multi_active_candidates():
     b.record_success()
     a.ewma_latency_ms = 500.0
     b.ewma_latency_ms = 50.0
-    b.weight = 99
     r = Router(BackendRegistry([a, b]))
 
     chosen, decision = r.choose(request_id="r1", model=a.models[0])

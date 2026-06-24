@@ -313,7 +313,6 @@ def test_complete_account_deploy_activates_target_and_drains_other_active(monkey
 
     result = runtime.complete_account_deploy("alice")
 
-    assert result["warmed"] == []
     assert result["activated"] == ["old"]
     assert result["retired"] == ["peer"]
     assert old.lifecycle == "active"
@@ -330,7 +329,6 @@ def test_complete_account_deploy_activates_when_no_peer_exists(monkeypatch):
 
     result = runtime.complete_account_deploy("alice")
 
-    assert result["warmed"] == []
     assert result["activated"] == ["only"]
     assert only.lifecycle == "active"
 
