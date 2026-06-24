@@ -275,9 +275,6 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       <span class="icon">⚡</span><span>网关状态</span>
       <span class="badge green" id="gwBadge">正常</span>
     </div>
-    <div class="nav-item" data-page="freeapi" onclick="switchPage('freeapi')">
-      <span class="icon">🌐</span><span>代理配置</span>
-    </div>
     <div class="nav-item" data-page="backends" onclick="switchPage('backends')">
       <span class="icon">🖥️</span><span>后端</span>
     </div>
@@ -286,9 +283,6 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     </div>
     <div class="nav-item" data-page="metrics" onclick="switchPage('metrics')">
       <span class="icon">📈</span><span>指标</span>
-    </div>
-    <div class="nav-item" data-page="vps" onclick="switchPage('vps')">
-      <span class="icon">🛰️</span><span>VPS 监控</span>
     </div>
     <div class="nav-item" data-page="api-docs" onclick="switchPage('api-docs')">
       <span class="icon">📖</span><span>API 文档</span>
@@ -726,29 +720,6 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     </div>
 
     <!-- ════ VPS Monitoring ════ -->
-    <div class="page" id="page-vps">
-      <div class="section" style="display:flex;align-items:center;justify-content:space-between">
-        <div>
-          <h2 style="margin:0">节点状态</h2>
-          <div id="vpsSummary" style="color:var(--text3);font-size:0.8rem;margin-top:4px">加载中…</div>
-        </div>
-        <div style="display:flex;gap:8px">
-          <button class="btn" onclick="vpsToggleAdd()">添加节点</button>
-          <button class="btn btn-primary" onclick="refreshVps()">刷新</button>
-        </div>
-      </div>
-      <div class="section" id="vpsAddPanel" style="display:none">
-        <h3 style="margin:0 0 10px 0;font-size:0.95rem">新增 VPS 节点</h3>
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
-          <input type="text" id="vpsNewName" placeholder="节点名（如 vps-tokyo）"
-                 style="flex:1;padding:8px;background:#0d1b2a;border:1px solid var(--border);border-radius:6px;color:var(--text)">
-          <button class="btn btn-primary" onclick="vpsAddNode()">创建并生成 token</button>
-        </div>
-        <div id="vpsAddResult" style="font-size:0.78rem;color:var(--text2)"></div>
-      </div>
-      <div class="vps-grid" id="vpsGrid"></div>
-    </div>
-
     <!-- ════ API Docs ════ -->
     <div class="page" id="page-api-docs">
       <div class="section">
@@ -824,56 +795,6 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     
 </div>
 
-<div class="page" id="page-freeapi">
-  <div class="topbar">
-    <div class="topbar-title">🌐 代理配置</div>
-    <div class="topbar-right">MiMo Free API 多通道管理</div>
-  </div>
-  <div class="content">
-    <div class="section">
-      <h2>⚙️ 基本设置</h2>
-      <div style="display:grid;gap:12px;grid-template-columns:1fr 1fr;max-width:700px">
-        <div>
-          <label style="display:block;font-size:0.82rem;color:var(--text2);margin-bottom:4px">启用免费API</label>
-          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-            <input type="checkbox" id="fa-enabled" onchange="saveFreeApiConfig()">
-            <span>启用</span>
-          </label>
-        </div>
-        <div>
-          <label style="display:block;font-size:0.82rem;color:var(--text2);margin-bottom:4px">模型列表</label>
-          <input type="text" id="fa-models" placeholder="mimo-auto,mimo-v2.5-pro,..." onchange="saveFreeApiConfig()">
-        </div>
-      </div>
-    </div>
-
-    <div class="section">
-      <h2>📡 本机直连IP</h2>
-      <div style="margin-bottom:10px;font-size:0.82rem;color:var(--text2)">
-        直接使用本机IP请求MiMo免费API，不经过代理。填"auto"用默认IP，也可指定具体本地IP。
-      </div>
-      <div id="fa-direct-ips"></div>
-      <button class="btn btn-ghost" onclick="addDirectIpField()" style="margin-top:8px">+ 添加本机IP</button>
-    </div>
-
-    <div class="section">
-      <h2>🔌 VLESS代理节点</h2>
-      <div style="margin-bottom:10px;font-size:0.82rem;color:var(--text2)">
-        通过本地sing-box代理端口转发请求。每个端口对应一个VLESS节点。
-      </div>
-      <div id="fa-proxy-ports"></div>
-      <button class="btn btn-ghost" onclick="addProxyPortField()" style="margin-top:8px">+ 添加代理端口</button>
-    </div>
-
-    <div class="section">
-      <h2>📊 通道状态</h2>
-      <div id="fa-loading">加载中...</div>
-      <div id="fa-channels" style="display:none">
-        <div id="fa-channels-table" style="overflow-x:auto"></div>
-      </div>
-    </div>
-  </div>
-</div>
 
 </div>
 
@@ -940,7 +861,7 @@ var PAGE_TITLES = {
   gateway: '网关状态', backends: '后端服务器',
   mappings: '模型映射',
   metrics: '指标与日志',
-  vps: 'VPS 监控', 'api-docs': 'API 文档', 'panel-acl': '访问控制', secrets: '密钥管理'
+  'api-docs': 'API 文档', 'panel-acl': '访问控制', secrets: '密钥管理'
 };
 
 function switchPage(name) {
@@ -966,7 +887,6 @@ function switchPage(name) {
   if (name === 'backends') refreshBackends();
   if (name === 'mappings') refreshMappings();
   if (name === 'metrics') refreshMetrics();
-  if (name === 'vps') refreshVps();
   if (name === 'panel-acl') refreshPanelAcl();
   if (name === 'secrets') refreshSecrets();
 }
@@ -1191,6 +1111,8 @@ function renderAccountCards() {
     if (!a.is_current) html += '<button class="btn btn-primary" onclick="accSwitch(\'' + fn + '\')">切换为当前</button>';
     html += '<button class="btn btn-success" onclick="accClawCreate(\'' + fn + '\')">创建 Claw</button>';
     html += '<button class="btn btn-primary" onclick="accClawRefresh(\'' + fn + '\')">重建 Claw</button>';
+    html += '<button class="btn btn-ghost" onclick="accClawOp(\'' + fn + '\',\'repair\')" title="MiMo 修复：换一个新的空白 Claw（同一 4h 窗口），需重新部署隧道">修复</button>';
+    html += '<button class="btn btn-ghost" onclick="accClawOp(\'' + fn + '\',\'restart\')" title="MiMo 重启：换一个新的空白 Claw（同一 4h 窗口），需重新部署隧道">重启</button>';
     html += '<button class="btn btn-danger" onclick="accClawDestroy(\'' + fn + '\')">销毁 Claw</button>';
     html += '<button class="btn btn-ghost" onclick="accCheck(\'' + fn + '\')">检查状态</button>';
     html += '<button class="btn btn-ghost" onclick="accRelogin(\'' + fn + '\',\'' + escapeHtml(a.email || '') + '\')">重新登录</button>';
@@ -1240,6 +1162,17 @@ function accClawRefresh(filename) {
   api('POST', '/api/account/' + encodeURIComponent(filename) + '/claw/refresh').then(function(d) {
     toast(d.success ? 'Claw 已重建' : '失败：' + JSON.stringify(d.data || d.error), d.success ? 'success' : 'error');
     setTimeout(function() { accCheck(filename); }, 800);
+  });
+}
+
+// restart/repair/reset: operate on the existing claw, quota-free (same TTL).
+function accClawOp(filename, op) {
+  var label = {repair:'修复', restart:'重启', reset:'恢复出厂'}[op] || op;
+  if (op === 'reset' && !confirm('恢复出厂会清空 ' + filename + ' 的 Claw 工作区，确定？')) return;
+  toast(label + ' Claw 中...', '');
+  api('POST', '/api/account/' + encodeURIComponent(filename) + '/claw/' + op).then(function(d) {
+    toast(d.success ? 'Claw ' + label + '已触发' : '失败：' + JSON.stringify(d.data || d.error), d.success ? 'success' : 'error');
+    setTimeout(function() { accCheck(filename); }, 1500);
   });
 }
 
@@ -2252,160 +2185,6 @@ function _barRow(label, value, pct) {
     '</div>';
 }
 
-function _installCmd(token) {
-  var origin = location.origin;
-  return 'curl -fsSL ' + origin + '/probe/install.sh/' + token + ' | sudo bash';
-}
-
-function refreshVps() {
-  Promise.all([
-    api('GET', '/api/gateway/vps'),
-    api('GET', '/api/probe/nodes'),
-  ]).then(function(results) {
-    var status = results[0], reg = results[1];
-    var summary = status.summary || {};
-    document.getElementById('vpsSummary').textContent =
-      '共 ' + (summary.total || 0) + ' 个 · 在线 ' + (summary.up || 0) +
-      ' · 离线 ' + (summary.down || 0) +
-      '（' + (summary.offline_after_s || 30) + 's 无上报判离线）';
-
-    // Merge: tokens come from /api/probe/nodes; samples from /api/gateway/vps
-    var tokenById = {};
-    (reg.nodes || []).forEach(function(n) { tokenById[n.id] = n.token; });
-
-    var grid = document.getElementById('vpsGrid');
-    var nodes = status.nodes || [];
-    if (nodes.length === 0) {
-      grid.innerHTML = '<div style="color:var(--text3);font-size:0.82rem;padding:20px;text-align:center;grid-column:1/-1">' +
-        '暂无 VPS 节点。点击右上角"添加节点"开始。</div>';
-      return;
-    }
-    var html = '';
-    for (var i = 0; i < nodes.length; i++) {
-      var n = nodes[i];
-      var s = n.sample;
-      var pillCls = n.online ? 'up' : 'down';
-      var pillText = n.online ? '在线' : '离线';
-      var lastSeen = n.last_seen
-        ? new Date(n.last_seen * 1000).toLocaleTimeString('zh-CN', {hour12: false})
-        : '从未';
-
-      var body = '';
-      if (n.online && s) {
-        var memUsed = (s.memory && s.memory.used_mb) ? s.memory.used_mb * 1048576 : 0;
-        var memTotal = (s.memory && s.memory.total_mb) ? s.memory.total_mb * 1048576 : 0;
-        var diskUsed = (s.disk && s.disk.used_gb) ? s.disk.used_gb * 1073741824 : 0;
-        var diskTotal = (s.disk && s.disk.total_gb) ? s.disk.total_gb * 1073741824 : 0;
-        body =
-          _barRow('CPU', (s.cpu_percent || 0).toFixed(1) + '%', s.cpu_percent || 0) +
-          _barRow('内存 (' + _fmtBytes(memUsed) + ' / ' + _fmtBytes(memTotal) + ')',
-                  ((s.memory && s.memory.percent) || 0).toFixed(1) + '%',
-                  (s.memory && s.memory.percent) || 0) +
-          _barRow('磁盘 (' + _fmtBytes(diskUsed) + ' / ' + _fmtBytes(diskTotal) + ')',
-                  ((s.disk && s.disk.percent) || 0).toFixed(1) + '%',
-                  (s.disk && s.disk.percent) || 0) +
-          '<div class="vps-net">' +
-            '<div><div class="lbl">↓ 下载</div><div class="val rx">' +
-              _fmtSpeed((s.network && s.network.rx_speed_bps) || 0) + '</div></div>' +
-            '<div><div class="lbl">↑ 上传</div><div class="val tx">' +
-              _fmtSpeed((s.network && s.network.tx_speed_bps) || 0) + '</div></div>' +
-          '</div>';
-        if (s.load && s.load.length) {
-          body += '<div class="vps-foot"><span>Load ' +
-            s.load.map(function(x){return x.toFixed(2)}).join(' / ') + '</span>' +
-            '<span>up ' + _fmtUptime(s.uptime_seconds) + '</span></div>';
-        }
-      } else {
-        body = '<div style="padding:14px;text-align:center;color:var(--text3);font-size:0.82rem">' +
-          '探针未上报' + (n.last_seen ? '（最后 ' + lastSeen + '）' : '') +
-          '<div class="install-block">' + escapeHtml(_installCmd(tokenById[n.id] || '<token>')) + '</div>' +
-          '</div>';
-      }
-
-      var hostname = (s && s.os && s.os.hostname) ? s.os.hostname : '';
-      var distro = (s && s.os && s.os.distro) ? s.os.distro : '';
-      html += '<div class="vps-card">' +
-        '<div style="display:flex;justify-content:space-between;align-items:start;gap:8px">' +
-          '<div style="min-width:0;flex:1">' +
-            '<div class="name">' + escapeHtml(n.name) + '</div>' +
-            '<div class="meta">' + escapeHtml(hostname) +
-              (distro ? ' · ' + escapeHtml(distro) : '') + '</div>' +
-          '</div>' +
-          '<span class="pill ' + pillCls + '">' + pillText + '</span>' +
-        '</div>' +
-        body +
-        '<div class="vps-foot">' +
-          '<span>上次上报 ' + lastSeen + '</span>' +
-          '<div class="vps-actions">' +
-            '<button class="icon-btn" onclick="vpsShowInstall(\'' + n.id + '\',\'' +
-              escapeHtml(tokenById[n.id] || '') + '\')">安装命令</button>' +
-            '<button class="icon-btn" onclick="vpsRegenToken(\'' + n.id + '\')">换 token</button>' +
-            '<button class="icon-btn" onclick="vpsDeleteNode(\'' + n.id + '\',\'' +
-              escapeHtml(n.name) + '\')">删除</button>' +
-          '</div>' +
-        '</div>' +
-      '</div>';
-    }
-    grid.innerHTML = html;
-  }).catch(function() {
-    document.getElementById('vpsGrid').innerHTML =
-      '<div style="color:var(--red);font-size:0.82rem;padding:20px">无法加载探针数据</div>';
-  });
-}
-
-function vpsToggleAdd() {
-  var p = document.getElementById('vpsAddPanel');
-  p.style.display = p.style.display === 'none' ? '' : 'none';
-}
-
-function vpsAddNode() {
-  var name = (document.getElementById('vpsNewName').value || '').trim();
-  if (!name) { toast('请填写节点名', 'error'); return; }
-  api('POST', '/api/probe/nodes/add', {name: name}).then(function(d) {
-    if (d.error) { toast(d.error, 'error'); return; }
-    document.getElementById('vpsNewName').value = '';
-    document.getElementById('vpsAddResult').innerHTML =
-      '已创建。SSH 到 VPS 执行：<div class="install-block">' +
-      escapeHtml(_installCmd(d.token)) + '</div>' +
-      '<div style="margin-top:6px;color:var(--text3)">需要 root 权限和 python3。脚本会自动写 systemd unit 并启动。</div>';
-    toast('节点已添加', 'success');
-    refreshVps();
-  }).catch(function() { toast('添加失败', 'error'); });
-}
-
-function vpsShowInstall(id, token) {
-  if (!token) { toast('无 token', 'error'); return; }
-  document.getElementById('vpsAddPanel').style.display = '';
-  document.getElementById('vpsAddResult').innerHTML =
-    '安装命令：<div class="install-block">' + escapeHtml(_installCmd(token)) + '</div>';
-}
-
-function vpsRegenToken(id) {
-  if (!confirm('换 token 后旧探针会失效，确定？')) return;
-  api('POST', '/api/probe/nodes/' + id + '/regen-token').then(function(d) {
-    if (d.token) {
-      vpsShowInstall(id, d.token);
-      toast('token 已更新', 'success');
-      refreshVps();
-    } else { toast('失败', 'error'); }
-  }).catch(function() { toast('失败', 'error'); });
-}
-
-function vpsDeleteNode(id, name) {
-  if (!confirm('删除节点 ' + name + '？')) return;
-  api('POST', '/api/probe/nodes/' + id + '/delete').then(function() {
-    toast('已删除', 'success');
-    refreshVps();
-  }).catch(function() { toast('删除失败', 'error'); });
-}
-
-window.refreshVps = refreshVps;
-window.vpsToggleAdd = vpsToggleAdd;
-window.vpsAddNode = vpsAddNode;
-window.vpsShowInstall = vpsShowInstall;
-window.vpsRegenToken = vpsRegenToken;
-window.vpsDeleteNode = vpsDeleteNode;
-
 // Panel access control
 var aclCurrentIp = '';
 function refreshPanelAcl() {
@@ -2983,196 +2762,6 @@ document.getElementById('ssoCode').addEventListener('keydown', function(e) {
 document.getElementById('ssoPassword').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') { e.preventDefault(); ssoLogin(); }
 });
-</script>
-
-<script>
-// ── Free API / Proxy Config ──
-
-function addDirectIpField() {
-  const container = document.getElementById('fa-direct-ips');
-  const div = document.createElement('div');
-  div.style.marginBottom = '6px';
-  div.style.display = 'flex';
-  div.style.gap = '6px';
-  div.innerHTML = '<input type="text" placeholder="auto 或 154.219.100.236" style="flex:1;font-family:monospace" onchange="saveFreeApiConfig()">'
-    + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
-  container.appendChild(div);
-}
-
-function addProxyPortField() {
-  const container = document.getElementById('fa-proxy-ports');
-  const div = document.createElement('div');
-  div.style.marginBottom = '6px';
-  div.style.display = 'flex';
-  div.style.gap = '6px';
-  div.innerHTML = '<input type="number" placeholder="11000" style="flex:1;font-family:monospace" min="1024" max="65535" onchange="saveFreeApiConfig()">'
-    + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
-  container.appendChild(div);
-}
-
-async function loadFreeApiConfig() {
-  const loadEl = document.getElementById('fa-loading');
-  const channelsEl = document.getElementById('fa-channels');
-  loadEl.style.display = 'block';
-  loadEl.textContent = '加载中...';
-  channelsEl.style.display = 'none';
-
-  try {
-    const resp = await fetch('/api/free-api/config');
-    const data = await resp.json();
-
-    document.getElementById('fa-enabled').checked = data.enabled || false;
-    document.getElementById('fa-models').value = (data.models || []).join(',');
-
-    // Direct IPs
-    const dc = document.getElementById('fa-direct-ips');
-    dc.innerHTML = '';
-    const ips = (data.direct_ips && data.direct_ips.length) ? data.direct_ips : ['auto'];
-    ips.forEach(ip => {
-      const div = document.createElement('div');
-      div.style.marginBottom = '6px';
-      div.style.display = 'flex';
-      div.style.gap = '6px';
-      div.innerHTML = '<input type="text" value="' + ip.replace(/"/g,'&quot;') + '" style="flex:1;font-family:monospace" onchange="saveFreeApiConfig()">'
-        + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
-      dc.appendChild(div);
-    });
-
-    // Proxy ports
-    const pc = document.getElementById('fa-proxy-ports');
-    pc.innerHTML = '';
-    (data.proxy_ports || []).forEach(port => {
-      const div = document.createElement('div');
-      div.style.marginBottom = '6px';
-      div.style.display = 'flex';
-      div.style.gap = '6px';
-      div.innerHTML = '<input type="number" value="' + port + '" style="flex:1;font-family:monospace" min="1024" max="65535" onchange="saveFreeApiConfig()">'
-        + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
-      pc.appendChild(div);
-    });
-
-    // Channels table
-    loadEl.style.display = 'none';
-    channelsEl.style.display = 'block';
-    const tableEl = document.getElementById('fa-channels-table');
-
-    if (data.channels && data.channels.length > 0) {
-      let html = '<table style="width:100%;border-collapse:collapse;font-size:0.82rem">';
-      html += '<thead><tr style="border-bottom:1px solid var(--border);color:var(--text3)">';
-      html += '<th style="padding:8px 6px;text-align:left">通道ID</th>';
-      html += '<th style="padding:8px 6px;text-align:left">类型</th>';
-      html += '<th style="padding:8px 6px;text-align:left">目标</th>';
-      html += '<th style="padding:8px 6px;text-align:center">健康</th>';
-      html += '<th style="padding:8px 6px;text-align:center">JWT</th>';
-      html += '<th style="padding:8px 6px;text-align:right">过期时间</th>';
-      html += '<th style="padding:8px 6px;text-align:center">操作</th>';
-      html += '</tr></thead><tbody>';
-
-      data.channels.forEach(ch => {
-        const expiresMin = ch.jwt_expires_in ? Math.floor(ch.jwt_expires_in / 60) + 'm' : '-';
-        const healthIcon = ch.healthy ? '<span class="indicator green"></span>' : '<span class="indicator red"></span>';
-        const jwtIcon = ch.has_jwt ? '<span class="indicator green"></span>' : '<span class="indicator gray"></span>';
-        const typeText = ch.type === 'direct' ? '直连' : '代理';
-
-        html += '<tr style="border-bottom:1px solid var(--border)">';
-        html += '<td style="padding:8px 6px;font-family:monospace;font-size:0.75rem">' + ch.id + '</td>';
-        html += '<td style="padding:8px 6px">' + typeText + '</td>';
-        html += '<td style="padding:8px 6px;font-family:monospace;font-size:0.75rem">' + ch.target + '</td>';
-        html += '<td style="padding:8px 6px;text-align:center">' + healthIcon + '</td>';
-        html += '<td style="padding:8px 6px;text-align:center">' + jwtIcon + '</td>';
-        html += '<td style="padding:8px 6px;text-align:right;font-size:0.75rem">' + expiresMin + '</td>';
-        html += '<td style="padding:8px 6px;text-align:center">';
-        html += '<button class="btn btn-ghost" onclick="testChannel(\'' + ch.id + '\')" style="font-size:0.75rem;padding:2px 8px">测试</button>';
-        html += '</td></tr>';
-
-        if (ch.last_error) {
-          html += '<tr style="border-bottom:1px solid var(--border)">';
-          html += '<td colspan="7" style="padding:2px 6px 8px;font-size:0.75rem;color:var(--red)">\u26a0 ' + ch.escaped_error + '</td>';
-          html += '</tr>';
-        }
-      });
-
-      html += '</tbody></table>';
-      tableEl.innerHTML = html;
-    } else {
-      tableEl.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3)">暂无通道，请先启用并配置</div>';
-    }
-  } catch(e) {
-    loadEl.textContent = '\u274c 加载失败: ' + e.message;
-  }
-}
-
-async function saveFreeApiConfig() {
-  const enabled = document.getElementById('fa-enabled').checked;
-  const modelsRaw = document.getElementById('fa-models').value;
-  const models = modelsRaw.split(',').map(s => s.trim()).filter(Boolean);
-
-  const directIps = [];
-  document.querySelectorAll('#fa-direct-ips input').forEach(inp => {
-    const v = inp.value.trim();
-    if (v) directIps.push(v);
-  });
-
-  const proxyPorts = [];
-  document.querySelectorAll('#fa-proxy-ports input').forEach(inp => {
-    const v = parseInt(inp.value);
-    if (!isNaN(v) && v > 0) proxyPorts.push(v);
-  });
-
-  try {
-    const resp = await fetch('/api/free-api/config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({enabled: enabled, models: models, direct_ips: directIps, proxy_ports: proxyPorts}),
-    });
-    const result = await resp.json();
-    if (result.success) {
-      showToast('\u2714 配置已保存', 'success');
-      loadFreeApiConfig();
-    } else {
-      showToast('\u274c ' + (result.error || '保存失败'), 'error');
-    }
-  } catch(e) {
-    showToast('\u274c ' + e.message, 'error');
-  }
-}
-
-async function testChannel(channelId) {
-  showToast('\ud83d\udd0d 测试中...', '');
-  try {
-    const resp = await fetch('/api/free-api/test/' + encodeURIComponent(channelId), {method: 'POST'});
-    const result = await resp.json();
-    if (result.success) {
-      showToast(channelId + ' \u2714\ufe0f ' + result.latency_ms + 'ms', 'success');
-    } else {
-      showToast(channelId + ' \u274c ' + result.error, 'error');
-    }
-  } catch(e) {
-    showToast('\u274c ' + e.message, 'error');
-  }
-}
-
-// Hook page switch
-(function() {
-  const orig = window.switchPage;
-  if (orig) {
-    window.switchPage = function(page) {
-      orig(page);
-      if (page === 'freeapi') loadFreeApiConfig();
-    };
-  }
-})();
-
-// Hook page switch
-(function() {
-  const orig = window.switchPage;
-  if (orig) {
-    window.switchPage = function(page) {
-      orig(page);
-      if (page === 'freeapi') loadFreeApiConfig();
-    };
-  }
-})();
 </script>
 </body>
 </html>

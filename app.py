@@ -160,12 +160,6 @@ async def auth_middleware(request: Request, call_next):
     # Gateway API routes handle their own auth (Bearer token)
     if path.startswith("/v1/") or path in ("/health", "/gateway/status"):
         return await call_next(request)
-    # Probe agent uses its own X-Probe-Token header
-    if path == "/api/probe/report":
-        return await call_next(request)
-    # Probe install assets (agent.py + install.sh) are public — token is in URL
-    if path.startswith("/probe/"):
-        return await call_next(request)
     # Public status endpoint — key-gated inside the handler (separate token),
     # so it's exempt from the panel cookie/login here.
     if path == "/api/public/status":
@@ -218,14 +212,6 @@ async def startup_event():
         start_router_probe()
     except Exception as e:
         logger.exception("[startup] Failed to start gateway probe")
-    try:
-        from gateway.free_api import get_pool
-        pool = get_pool()
-        pool.start()
-        loop = asyncio.get_running_loop()
-        loop.create_task(pool.start_async())
-    except Exception:
-        logger.exception("[startup] Failed to start free API pool")
     # Human-like WS activity loop: keeps each deployed Claw engaged, repairs the
     # reverse tunnel, and drives expiry/health rotation. Gated so a fresh host
     # stays quiet until accounts are verified.
@@ -257,12 +243,6 @@ async def shutdown_event():
     except Exception as e:
         logger.exception("[shutdown] Failed to close gateway runtime")
     try:
-        from gateway.free_api import get_pool
-        pool = get_pool()
-        await pool.shutdown()
-    except Exception:
-        logger.exception("[shutdown] Failed to stop free API pool")
-    try:
         from gateway.auth import close_key_store
         close_key_store()
     except Exception as e:
@@ -289,11 +269,10 @@ _ACCOUNTS_DIR_RESOLVED: Path | None = None
 def _is_public_path(path: str) -> bool:
     """Paths reachable from ANY ip (not gated by the panel IP allowlist):
     the public API, token-authed probe/status channels and health."""
-    if path.startswith(("/v1/", "/static", "/probe/")):
+    if path.startswith(("/v1/", "/static")):
         return True
     return path in (
-        "/health", "/gateway/status", "/api/public/status",
-        "/api/probe/report", "/ws",
+        "/health", "/gateway/status", "/api/public/status", "/ws",
     )
 
 
@@ -1156,8 +1135,12 @@ async def claw_ws_chat(
                         continue
                     if dtype != "event":
                         continue
-                    if devent == "health":
+                    if devent in ("health", "tick"):
                         continue
+                    if devent == "shutdown":
+                        # Server signalled the claw is going down — stop waiting.
+                        debug_log.append("shutdown event")
+                        break
                     if devent == "agent" and dpayload.get("stream") == "assistant":
                         delta = dpayload.get("data", {}).get("delta", "")
                         if delta:
@@ -1404,6 +1387,38 @@ async def account_claw_destroy(filename: str):
     success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
     _invalidate_summary(filename)
     return {"success": success, "code": code, "data": data}
+
+
+# Lifecycle ops on the claw (openclaw 2026.5.27). Each spawns a NEW blank claw
+# instance within the SAME 4h window (new requestId, workspace reset) — so after
+# any of these the claw needs full re-bootstrap (SOUL + tunnel). Daily-quota
+# impact is unverified. Operator-initiated only.
+#   restart -> MANUAL_RESTART   repair -> MANUAL_REPAIR   reset -> FACTORY_RESET
+async def _account_claw_lifecycle(filename: str, op: str):
+    acc = _load_account_by_filename(filename)
+    if not acc:
+        return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
+    cookies = acc.get("cookies", [])
+    code, data = await acurl("POST", f"/open-apis/user/mimo-claw/{op}",
+                             body={}, cookies=cookies)
+    success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+    _invalidate_summary(filename)
+    return {"success": success, "code": code, "data": data}
+
+@app.post("/api/account/{filename}/claw/restart")
+async def account_claw_restart(filename: str):
+    """Restart an account's existing claw (quota-free, same TTL)."""
+    return await _account_claw_lifecycle(filename, "restart")
+
+@app.post("/api/account/{filename}/claw/repair")
+async def account_claw_repair(filename: str):
+    """Repair an account's existing claw (quota-free, same TTL)."""
+    return await _account_claw_lifecycle(filename, "repair")
+
+@app.post("/api/account/{filename}/claw/reset")
+async def account_claw_reset(filename: str):
+    """Factory-reset an account's existing claw (quota-free, same TTL)."""
+    return await _account_claw_lifecycle(filename, "reset")
 
 @app.post("/api/account/{filename}/claw/refresh")
 async def account_claw_refresh(filename: str):
@@ -1893,52 +1908,6 @@ async def claw_activity_status():
         return {"running": False, "accounts": {}, "error": f"{type(e).__name__}: {e}"}
 
 
-# ──────────── Free API / Proxy config endpoints ────────────
-
-
-@app.get("/api/free-api/config")
-async def free_api_config():
-    """Get free API pool config + channel status."""
-    try:
-        from gateway.free_api import get_pool
-        pool = get_pool()
-        return pool.get_config()
-    except ImportError:
-        return {"enabled": False, "channels": []}
-
-
-@app.post("/api/free-api/config")
-async def free_api_update_config(request: Request):
-    """Update free API pool configuration."""
-    try:
-        from gateway.free_api import FreeApiConfig, get_pool
-        body = await request.json()
-        FreeApiConfig.save(body)
-        pool = get_pool()
-        pool.reload()
-        return {"success": True}
-    except ImportError:
-        return {"success": False, "error": "Free API module not installed"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/api/free-api/test/{channel_id}")
-async def free_api_test_channel(channel_id: str):
-    """Test a specific free API channel."""
-    try:
-        from gateway.free_api import get_pool
-        pool = get_pool()
-        import asyncio
-        result = await pool.test_channel(channel_id)
-        return result
-    except ImportError:
-        return {"success": False, "error": "Free API module not installed"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-
 # ──────────── Gateway API endpoints ────────────
 
 @app.get("/api/gateway/status")
@@ -2140,29 +2109,6 @@ async def public_status(request: Request, key: str = ""):
     return data
 
 
-@app.get("/api/gateway/vps")
-async def gateway_vps_status():
-    """List monitored VPS nodes with latest agent samples."""
-    from gateway.probe_registry import list_nodes, OFFLINE_AFTER_S
-    nodes = list_nodes()
-    online = sum(1 for n in nodes if n["online"])
-    return {
-        "summary": {
-            "total": len(nodes),
-            "up": online,
-            "down": len(nodes) - online,
-            "offline_after_s": OFFLINE_AFTER_S,
-        },
-        "nodes": nodes,
-    }
-
-
-@app.post("/api/gateway/vps/refresh")
-async def gateway_vps_refresh():
-    """Re-read latest snapshots (no-op now: agent push, not poll)."""
-    return await gateway_vps_status()
-
-
 # ────────────── Model mapping groups ──────────────
 
 @app.get("/api/model-groups")
@@ -2273,55 +2219,6 @@ async def model_groups_import_backends(request: Request):
         group_name=body.get("group_name") or "MiMo 原生",
     )
     return {"success": True, **result}
-
-
-@app.get("/api/probe/nodes")
-async def probe_nodes_list():
-    """Panel-only: list nodes including their tokens (for install command)."""
-    from gateway.probe_registry import list_nodes
-    return {"nodes": list_nodes(include_token=True)}
-
-
-@app.post("/api/probe/nodes/add")
-async def probe_node_add(request: Request):
-    """Body: {name}. Returns {id, name, token}."""
-    from gateway.probe_registry import add_node
-    body = await request.json()
-    try:
-        return add_node(body.get("name", ""))
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
-@app.post("/api/probe/nodes/{node_id}/delete")
-async def probe_node_delete(node_id: str):
-    from gateway.probe_registry import delete_node
-    ok = delete_node(node_id)
-    return {"success": ok} if ok else JSONResponse(
-        {"success": False, "error": "节点不存在"}, status_code=404)
-
-
-@app.post("/api/probe/nodes/{node_id}/regen-token")
-async def probe_node_regen_token(node_id: str):
-    from gateway.probe_registry import regenerate_token
-    token = regenerate_token(node_id)
-    return {"token": token} if token else JSONResponse(
-        {"error": "节点不存在"}, status_code=404)
-
-
-@app.post("/api/probe/report")
-async def probe_report(request: Request):
-    """Agent endpoint — called every interval seconds with a sample."""
-    from gateway.probe_registry import ingest_report
-    token = request.headers.get("X-Probe-Token", "")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-    ok = ingest_report(token, body.get("name"), body.get("sample") or {})
-    if not ok:
-        return JSONResponse({"error": "unknown token"}, status_code=401)
-    return {"ok": True}
 
 
 # ──────────── Panel access control (IP allowlist) ────────────
@@ -2534,125 +2431,6 @@ async def secrets_rotate(request: Request):
     if field == "panel_session_token":
         resp.set_cookie(AUTH_COOKIE, value, max_age=86400 * 30, httponly=True)
     return resp
-
-
-# ──────────── Probe public install assets ────────────
-# These are intentionally unauthenticated so the one-liner
-# `curl panel/probe/install.sh/<token> | sudo bash` works on a fresh VPS.
-# The token in the URL is the same per-node token used for /api/probe/report.
-
-PROBE_DIR = BASE_DIR / "probe"
-
-
-@app.get("/probe/agent.py")
-async def probe_get_agent():
-    """Serve agent.py for the install script to download."""
-    p = PROBE_DIR / "agent.py"
-    if not p.exists():
-        return PlainTextResponse("agent.py not found", status_code=404)
-    return PlainTextResponse(p.read_text(encoding="utf-8"), media_type="text/x-python")
-
-
-@app.get("/probe/install.sh/{token}")
-async def probe_install_script(token: str, request: Request, name: str = ""):
-    """One-shot installer. URL: <panel>/probe/install.sh/<token>?name=<optional>.
-
-    Validates the token exists, then returns a bash script with all values
-    baked in. The script downloads agent.py, writes a systemd unit, starts it.
-    """
-    from gateway.probe_registry import list_nodes
-    nodes = list_nodes(include_token=True)
-    matched = next((n for n in nodes if n.get("token") == token), None)
-    if not matched:
-        return PlainTextResponse(
-            "echo 'ERROR: invalid or expired token'; exit 1\n",
-            status_code=404, media_type="text/x-shellscript",
-        )
-    base = str(request.base_url).rstrip("/")
-    display_name = name or matched.get("name", "")
-    # Shell-escape values that get interpolated into the script.
-    def _q(s):
-        return "'" + str(s).replace("'", "'\\''") + "'"
-
-    script = f"""#!/bin/bash
-# MiMo VPS probe — one-shot installer
-set -e
-
-PROBE_URL={_q(base + "/api/probe/report")}
-PROBE_TOKEN={_q(token)}
-PROBE_NAME={_q(display_name) if display_name else '"$(hostname)"'}
-PROBE_INTERVAL="${{PROBE_INTERVAL:-10}}"
-INSTALL_DIR="${{INSTALL_DIR:-/opt/mimo-probe}}"
-AGENT_URL={_q(base + "/probe/agent.py")}
-
-if [ "$EUID" -ne 0 ]; then
-    echo "ERROR: must run as root (try: curl ... | sudo bash)"
-    exit 1
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "ERROR: python3 not found. Please install python3 first."
-    exit 1
-fi
-
-echo ">> Installing to $INSTALL_DIR"
-mkdir -p "$INSTALL_DIR"
-
-echo ">> Fetching agent.py from $AGENT_URL"
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$AGENT_URL" -o "$INSTALL_DIR/agent.py"
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$INSTALL_DIR/agent.py" "$AGENT_URL"
-else
-    echo "ERROR: need curl or wget"
-    exit 1
-fi
-chmod 755 "$INSTALL_DIR/agent.py"
-
-echo ">> Writing /etc/systemd/system/mimo-probe.service"
-cat > /etc/systemd/system/mimo-probe.service <<UNIT
-[Unit]
-Description=MiMo VPS Probe Agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment=PROBE_URL=$PROBE_URL
-Environment=PROBE_TOKEN=$PROBE_TOKEN
-Environment=PROBE_NAME=$PROBE_NAME
-Environment=PROBE_INTERVAL=$PROBE_INTERVAL
-ExecStart=/usr/bin/python3 $INSTALL_DIR/agent.py
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-echo ">> Enabling and starting mimo-probe"
-systemctl daemon-reload
-systemctl enable --now mimo-probe
-
-sleep 2
-if systemctl is-active --quiet mimo-probe; then
-    echo ""
-    echo "✓ mimo-probe is running"
-    echo "  Logs:   journalctl -u mimo-probe -f"
-    echo "  Status: systemctl status mimo-probe"
-else
-    echo ""
-    echo "✗ mimo-probe failed to start"
-    journalctl -u mimo-probe --no-pager -n 30
-    exit 1
-fi
-"""
-    return PlainTextResponse(script, media_type="text/x-shellscript")
-
-
-
 
 # ──────────── Gateway Proxy Routes ────────────
 

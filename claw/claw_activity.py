@@ -781,12 +781,16 @@ def _run_activity_once(account: str) -> None:
             # If healthy → streak resets to 0; if still bad → re-enter here
             # (TTL will be shorter, eventually below threshold → redeploy).
         else:
+            # Low TTL and still unhealthy. The claw is still AVAILABLE (DESTROYED
+            # is handled earlier). A full redeploy needs a create, which is
+            # blocked within the daily cooldown — so if we've already created
+            # today, ride out the remaining TTL and let the fleet relay to a
+            # fresh available account. (MiMo repair/restart spawn a NEW blank
+            # claw that would need full re-bootstrap, so they are NOT a cheap
+            # in-place fix — left to a future repair-mode redeploy.)
             if _account_in_cooldown(account):
-                # No create quota left today — can't redeploy this account. Ride
-                # out the remaining TTL; the fleet will cold-start a fresh
-                # available account when this claw finally expires.
                 logger.info(
-                    "[activity] %s: unhealthy, TTL ~%dmin, but already created today (quota used) — no redeploy",
+                    "[activity] %s: unhealthy, TTL ~%dmin, already created today — no redeploy (relay covers it)",
                     account, ttl // 60,
                 )
             else:

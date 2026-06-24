@@ -33,7 +33,6 @@ from gateway.core import BadRequestError, GatewayError, RequestContext
 from gateway.handler import GatewayHandler
 from gateway.routing import Backend, BackendRegistry, InMemoryDecisionLog, Router
 from gateway.secrets_store import secrets
-from gateway.free_api import get_pool, make_free_api_backends
 from gateway.transport import HttpxTransport
 
 logger = logging.getLogger(__name__)
@@ -132,14 +131,6 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
         in_detection=bool(entry.get("in_detection", False)),
         detection_entered_at=float(entry.get("detection_entered_at") or 0.0),
     )
-    if backend.metadata.get("type") == "free_api":
-        # Prefer direct egress first; spill into proxies only when direct has in-flight load.
-        if backend.metadata.get("is_proxy"):
-            backend.weight = 1
-            backend.max_in_flight = 1
-        else:
-            backend.weight = 50
-            backend.max_in_flight = 2
     return backend
 
 
@@ -200,14 +191,6 @@ def reload_backends() -> int:
     _ensure_initialized()
     assert _registry is not None
     new_entries = _build_backends_from_store()
-    # Inject free API channels as backends
-    try:
-        new_entries.extend(
-            _build_backend_from_entry(e)
-            for e in make_free_api_backends()
-        )
-    except Exception:
-        logger.exception("[reload] Failed to inject free API backends")
     now = time.time()
     seen: set[str] = set()
 
@@ -846,31 +829,10 @@ async def _run_readiness_checks(backend: Backend) -> tuple[bool, str, float]:
 async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, Any]) -> tuple[bool, str]:
     assert _transport is not None
     proxy_url = None
-    if backend.metadata and backend.metadata.get("type") == "free_api":
-        url = backend.base_url.rstrip("/")
-        headers = {"Content-Type": "application/json"}
-        # Fetch fresh JWT from pool
-        try:
-            from gateway.free_api import get_pool
-            pool = get_pool()
-            ch_id = backend.metadata.get("channel_id", "")
-            for ch in pool.get_channels():
-                if ch.channel_id == ch_id and ch.jwt:
-                    headers["Authorization"] = f"Bearer {ch.jwt}"
-                    break
-            else:
-                if backend.api_key:
-                    headers["Authorization"] = f"Bearer {backend.api_key}"
-        except Exception:
-            if backend.api_key:
-                headers["Authorization"] = f"Bearer {backend.api_key}"
-        headers["X-Mimo-Source"] = "mimocode-cli-free"
-        proxy_url = backend.metadata.get("proxy_url")
-    else:
-        url = backend.base_url.rstrip("/") + "/v1/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if backend.api_key:
-            headers["Authorization"] = f"Bearer {backend.api_key}"
+    url = backend.base_url.rstrip("/") + "/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if backend.api_key:
+        headers["Authorization"] = f"Bearer {backend.api_key}"
     try:
         if body.get("stream"):
             status, raw_iter = await _transport.post_stream(

@@ -958,6 +958,12 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                 if isinstance(d2, dict) and d2.get("code") == 0:
                     log.log("Claw create sent" + (f" (attempt {attempt})" if attempt > 1 else ""))
                     return True
+                # code 7001 = MiMo free-tier daily quota exhausted (1 create/day,
+                # 4h each). Expected, not an error to retry \u2014 the activity loop's
+                # per-day cooldown should normally prevent reaching here.
+                if isinstance(d2, dict) and d2.get("code") == 7001:
+                    log.log(f"\u26d4 \u4eca\u65e5\u514d\u8d39\u521b\u5efa\u989d\u5ea6\u5df2\u7528\u5b8c\uff087001\uff09\uff0c\u505c\u6b62: {d2.get('msg')}")
+                    return False
                 if not _is_retryable_create_429(d2):
                     log.log(f"\u274c \u521b\u5efa Claw \u5931\u8d25: {d2}")
                     return False

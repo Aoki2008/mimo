@@ -36,7 +36,6 @@ CONFIG_PATH = Path(os.environ.get("MIMO_CONFIG") or _DEFAULT)
 _LEGACY = {
     "backends": "backends.json",
     "panel_acl": "panel_acl.json",
-    "probe_nodes": "probe_nodes.json",
     "auto_deploy": "auto_deploy.json",
     "ssh_targets": "ssh_targets.json",
     "pin": "pin_config.json",
