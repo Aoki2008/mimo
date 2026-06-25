@@ -5,7 +5,8 @@ The Router's only job is: given a RequestContext, pick the active backend
 that can serve the requested model. Retry still lives in the handler, which can
 call ``choose`` again after excluding a backend. The gateway enforces one active
 backend at lifecycle boundaries, so legacy multi-active configs fall back to the
-first selectable backend in registry order until maintenance drains the extras.
+first selectable backend in registry order until lifecycle reconciliation drains
+the extras.
 """
 from __future__ import annotations
 
@@ -77,10 +78,6 @@ class Router:
                     excluded[b.backend_id] = "disabled"
                 elif getattr(b, "lifecycle", "active") != "active":
                     excluded[b.backend_id] = f"lifecycle={b.lifecycle}"
-                elif b.is_temporarily_disabled(now):
-                    excluded[b.backend_id] = (
-                        f"temporarily disabled for {b.disabled_until - now:.1f}s"
-                    )
                 elif b.is_open(now):
                     excluded[b.backend_id] = (
                         f"breaker open until {b.open_until - now:.1f}s"

@@ -58,6 +58,9 @@ def _migrate_entry(entry: dict) -> dict:
     entry["lifecycle"] = _normalize_lifecycle(entry.get("lifecycle"))
     entry.pop("weight", None)
     entry.pop("rotation_failures", None)
+    entry.pop("disabled_until", None)
+    entry.pop("in_detection", None)
+    entry.pop("detection_entered_at", None)
     if "models" in entry and isinstance(entry["models"], list):
         entry["models"] = _normalize_models(entry["models"])
         entry.pop("model", None)
@@ -179,9 +182,7 @@ def upsert_account_backend(
 
 def update_backend(backend_id: str, **fields: Any) -> dict[str, Any] | None:
     allowed = {"name", "base_url", "models", "api_key",
-               "account_id", "enabled", "lifecycle", "generation_id",
-               "disabled_until",
-               "in_detection", "detection_entered_at"}
+               "account_id", "enabled", "lifecycle", "generation_id"}
     # Legacy: caller passes {model, aliases} — fold into models.
     if "model" in fields or "aliases" in fields:
         legacy = []

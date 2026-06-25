@@ -53,20 +53,14 @@ _PROBE_INTERVAL_S = 30.0
 _PROBE_TIMEOUT_S = _env_float("GATEWAY_PROBE_TIMEOUT_S", 20.0)
 _PROBE_FAILURE_THRESHOLD = 3
 _PROBE_COOLDOWN_S = 30.0
-_PROBE_CONCURRENCY = 10
 _DEFAULT_REQUEST_TIMEOUT_S = 600.0
 _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
 
 # Gateway no longer owns account/backend relay policy. Claw free-tier TTL and
 # account relay are driven by ``claw.claw_activity``; the gateway keeps one
-# active backend and only performs health/model maintenance.
+# active backend and runs a lightweight health probe for that backend.
 _DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
 _DEPLOY_DRAIN_GRACE_S = _env_float("GATEWAY_DEPLOY_DRAIN_GRACE_S", 20.0)
-_DETECTION_ZONE_FAILURES = 2           # consecutive failures to enter detection
-_DETECTION_PROBE_INTERVAL_S = 10.0      # fast probe interval in detection zone
-_MAINTENANCE_LOOP_INTERVAL_S = _env_float("GATEWAY_MAINTENANCE_LOOP_INTERVAL_S", 60.0)
-# How often to re-sync each backend's model list from its /v1/models.
-_MODEL_SYNC_INTERVAL_S = _env_float("GATEWAY_MODEL_SYNC_INTERVAL_S", 300.0)
 
 _PROBE_PROMPT = "ping"
 
@@ -90,7 +84,6 @@ _handler: GatewayHandler | None = None
 _decision_log: InMemoryDecisionLog | None = None
 _adapters: dict[str, ProtocolAdapter] = {}
 _probe_task: asyncio.Task | None = None
-_maintenance_task: asyncio.Task | None = None
 _started_at: float = time.time()
 _total_requests: int = 0
 
@@ -122,9 +115,6 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
         metadata=meta,
         lifecycle=lifecycle,
         generation_id=entry.get("generation_id") or entry.get("id") or "",
-        disabled_until=float(entry.get("disabled_until") or 0.0),
-        in_detection=bool(entry.get("in_detection", False)),
-        detection_entered_at=float(entry.get("detection_entered_at") or 0.0),
     )
     return backend
 
@@ -207,9 +197,6 @@ def reload_backends() -> int:
         existing.enabled = fresh.enabled
         existing.metadata = fresh.metadata
         existing.generation_id = fresh.generation_id
-        existing.disabled_until = fresh.disabled_until
-        existing.in_detection = fresh.in_detection
-        existing.detection_entered_at = fresh.detection_entered_at
         if fresh.lifecycle != existing.lifecycle:
             if fresh.lifecycle == "inactive":
                 existing.mark_inactive()
@@ -349,7 +336,6 @@ def get_router_status() -> dict[str, Any]:
         "backends_inactive": sum(1 for b in backends if b.lifecycle == "inactive"),
         "backends_draining": sum(1 for b in backends if b.lifecycle == "draining"),
         "backends_failed": sum(1 for b in backends if b.lifecycle == "failed"),
-        "backends_detection": sum(1 for b in backends if b.in_detection),
         "backends_degraded": sum(1 for b in backends if b.lifecycle == "active" and b.health == "degraded"),
     }
 
@@ -379,7 +365,6 @@ def get_all_backends() -> list[dict[str, Any]]:
             "active_for_s": round(now - b.active_since, 1) if b.active_since else 0,
             "draining_for_s": round(now - b.draining_since, 1) if b.draining_since else 0,
             "drain_deadline_s": round(b.drain_deadline - now, 1) if b.drain_deadline else 0,
-            "disabled_until": b.disabled_until,
         })
     return out
 
@@ -398,9 +383,6 @@ def toggle_backend(backend_id: str) -> dict[str, Any]:
         b.reset_breaker()
         b.health = "alive"
         b.consecutive_failures = 0
-        b.disabled_until = 0.0
-        b.in_detection = False
-        b.detection_entered_at = 0.0
         retired = _activate_backend(b, reason="toggle")
     else:
         retired = []
@@ -408,7 +390,7 @@ def toggle_backend(backend_id: str) -> dict[str, Any]:
         _persist_backend_runtime_state(b)
 
     from gateway.backend_store import update_backend
-    update_backend(backend_id, enabled=new_enabled, lifecycle=b.lifecycle, disabled_until=b.disabled_until)
+    update_backend(backend_id, enabled=new_enabled, lifecycle=b.lifecycle)
 
     label = "启用" if new_enabled else "禁用"
     return {"success": True, "message": f"Backend {backend_id!r} {label}", "retired": retired}
@@ -486,7 +468,6 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
     retired: list[str] = []
     for backend in targets:
         backend.enabled = True
-        backend.disabled_until = 0.0
         backend.reset_breaker()
         backend.health = "alive"
         backend.consecutive_failures = 0
@@ -587,145 +568,47 @@ def _base_url_port(base_url: str) -> int | None:
         return None
 
 
-# ────────────── probe / maintenance loops ──────────────
+# ────────────── probe loop ──────────────
 
 
 async def _probe_loop() -> None:
-    """Chat-completion liveness probe with detection-zone quarantine.
-
-    Normal backends are probed every ``_PROBE_INTERVAL_S`` (30 s) with a real
-    non-stream ``/v1/chat/completions`` request. After
-    ``_DETECTION_ZONE_FAILURES`` (2) consecutive failures a backend enters the
-    detection zone where it is probed every ``_DETECTION_PROBE_INTERVAL_S``
-    (10 s). One successful chat probe exits the zone.
-    """
+    """Probe the current active backend with a non-stream chat completion."""
     _ensure_initialized()
     assert _registry is not None
 
-    async def _probe_one(backend: Backend, semaphore: asyncio.Semaphore) -> None:
-        async with semaphore:
-            if not backend.enabled or backend.lifecycle != "active":
-                return
-            # Probe ONE model chosen from the backend's own (non-tts/asr) model
-            # list — not a hardcoded model, and not every model.
-            started = time.monotonic()
-            try:
-                body = _probe_non_stream_body(backend)
-                ok, reason = await _run_one_probe_check(backend, "probe", body)
-            except Exception as e:  # noqa: BLE001
-                ok = False
-                reason = f"{type(e).__name__}: {e}"
-            latency = (time.monotonic() - started) * 1000
-            if ok:
-                backend.record_success()
-                backend.record_latency(latency)
-                if backend.in_detection:
-                    backend.exit_detection()
-                    logger.info("Backend %s exited detection zone (healthy)", backend.backend_id)
-                return
-
-            backend.record_probe_failure(
-                reason,
-                cooldown_s=_PROBE_COOLDOWN_S,
-                threshold=_PROBE_FAILURE_THRESHOLD,
-            )
-            if (backend.consecutive_failures >= _DETECTION_ZONE_FAILURES
-                    and not backend.in_detection):
-                backend.mark_detection()
-                logger.warning(
-                    "Backend %s entered detection zone (%d consecutive failures)",
-                    backend.backend_id, backend.consecutive_failures,
-                )
+    async def _probe_one(backend: Backend) -> None:
+        if not backend.enabled or backend.lifecycle != "active":
+            return
+        started = time.monotonic()
+        try:
+            body = _probe_non_stream_body(backend)
+            ok, reason = await _run_one_probe_check(backend, "probe", body)
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            reason = f"{type(e).__name__}: {e}"
+        latency = (time.monotonic() - started) * 1000
+        if ok:
+            backend.record_success()
+            backend.record_latency(latency)
+            return
+        backend.record_failure(
+            reason,
+            cooldown_s=_PROBE_COOLDOWN_S,
+            threshold=_PROBE_FAILURE_THRESHOLD,
+        )
 
     while True:
         try:
-            enabled_backends = [
-                b for b in _registry.all()
-                if b.enabled and b.lifecycle == "active"
-            ]
-            semaphore = asyncio.Semaphore(_PROBE_CONCURRENCY)
-            await asyncio.gather(
-                *(_probe_one(b, semaphore) for b in enabled_backends),
-                return_exceptions=True,
+            active = next(
+                (b for b in _registry.all() if b.enabled and b.lifecycle == "active"),
+                None,
             )
+            if active is not None:
+                await _probe_one(active)
             _reap_drained()
         except Exception:  # noqa: BLE001
             logger.exception("Gateway probe loop failed")
-        # Use shorter interval if any backend is in detection zone
-        any_in_detection = any(
-            b.in_detection for b in _registry.all() if b.enabled
-        )
-        interval = _DETECTION_PROBE_INTERVAL_S if any_in_detection else _PROBE_INTERVAL_S
-        await asyncio.sleep(interval)
-
-
-async def _maintenance_loop() -> None:
-    """Run lightweight backend maintenance for single-active mode."""
-    _ensure_initialized()
-    assert _registry is not None
-    while True:
-        try:
-            await _sync_backend_models()
-            _enforce_single_active_backend()
-            _reap_drained()
-        except Exception:  # noqa: BLE001
-            logger.exception("Gateway maintenance loop failed")
-        await asyncio.sleep(_MAINTENANCE_LOOP_INTERVAL_S)
-
-
-def _fetch_models_for(base_url: str, api_key: str = "") -> list[str] | None:
-    """GET <base_url>/v1/models and return a deduped id list, or None if the
-    endpoint is unreachable / 401 / unparseable (caller then leaves models
-    untouched — we never wipe a list just because one fetch failed)."""
-    import httpx
-    url = base_url.rstrip("/") + "/v1/models"
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    try:
-        r = httpx.get(url, timeout=8, trust_env=False, headers=headers)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-    except Exception:  # noqa: BLE001
-        return None
-    items = data.get("data") if isinstance(data, dict) else (data if isinstance(data, list) else None)
-    if not isinstance(items, list):
-        return None
-    out: list[str] = []
-    for it in items:
-        mid = it.get("id") if isinstance(it, dict) else (it if isinstance(it, str) else None)
-        if isinstance(mid, str) and mid.strip() and mid not in out:
-            out.append(mid.strip())
-    return out or None
-
-
-async def _sync_backend_models() -> None:
-    """Keep each backend's model list in lockstep with its upstream /v1/models:
-    add models that appear, drop models that no longer do — so a Claw upstream
-    silently adding/renaming/removing a model can't leave us routing to a model
-    it no longer serves. A failed/empty fetch is ignored (list left as-is)."""
-    assert _registry is not None
-    now = time.time()
-    for b in _registry.all():
-        if not b.enabled or b.lifecycle != "active":
-            continue
-        if now - b.last_model_sync_at < _MODEL_SYNC_INTERVAL_S:
-            continue
-        b.last_model_sync_at = now
-        fetched = await asyncio.to_thread(_fetch_models_for, b.base_url, b.api_key)
-        if not fetched or list(b.models) == fetched:
-            continue
-        added = [m for m in fetched if m not in b.models]
-        removed = [m for m in b.models if m not in fetched]
-        b.models = fetched
-        try:
-            from gateway.backend_store import update_backend
-            update_backend(b.backend_id, models=fetched)
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to persist synced models for %s", b.backend_id)
-        logger.info(
-            "Backend %s models synced from /v1/models (+%s -%s)",
-            b.backend_id, added, removed,
-        )
+        await asyncio.sleep(_PROBE_INTERVAL_S)
 
 
 def _activate_backend(backend: Backend, *, reason: str) -> list[str]:
@@ -823,17 +706,14 @@ def _persist_backend_runtime_state(backend: Backend) -> None:
             enabled=backend.enabled,
             lifecycle=backend.lifecycle,
             generation_id=backend.generation_id,
-            disabled_until=backend.disabled_until,
-            in_detection=backend.in_detection,
-            detection_entered_at=backend.detection_entered_at,
         )
     except Exception:
         logger.exception("Failed to persist backend state for %s", backend.backend_id)
 
 
 def start_probe() -> None:
-    """Idempotent. Spawns background liveness and maintenance tasks."""
-    global _probe_task, _maintenance_task
+    """Idempotent. Spawns the background liveness probe."""
+    global _probe_task
     _ensure_initialized()
     try:
         loop = asyncio.get_running_loop()
@@ -841,16 +721,13 @@ def start_probe() -> None:
         return
     if _probe_task is None or _probe_task.done():
         _probe_task = loop.create_task(_probe_loop())
-    if _maintenance_task is None or _maintenance_task.done():
-        _maintenance_task = loop.create_task(_maintenance_loop())
 
 
 async def shutdown() -> None:
     """Close runtime-owned background resources."""
-    global _probe_task, _maintenance_task
-    tasks = (_probe_task, _maintenance_task)
+    global _probe_task
+    tasks = (_probe_task,)
     _probe_task = None
-    _maintenance_task = None
     for task in tasks:
         if task is None:
             continue

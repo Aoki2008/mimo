@@ -48,15 +48,6 @@ class Backend:
     active_since: float = 0.0
     draining_since: float = 0.0
     drain_deadline: float = 0.0
-    disabled_until: float = 0.0
-
-    # Detection zone — fast-probe quarantine for flaky backends
-    in_detection: bool = False
-    detection_entered_at: float = 0.0
-    probe_consecutive_failures: int = 0
-
-    # Last time models were synced from this backend's /v1/models.
-    last_model_sync_at: float = 0.0
 
     # Breaker
     open_until: float = 0.0                  # epoch sec; 0 = closed
@@ -86,9 +77,6 @@ class Backend:
 
     # ───── lifecycle helpers ─────
 
-    def is_temporarily_disabled(self, now: float | None = None) -> bool:
-        return (now or time.time()) < self.disabled_until
-
     def mark_inactive(self) -> None:
         self.lifecycle = "inactive"
         self.draining_since = 0.0
@@ -102,7 +90,6 @@ class Backend:
         self.active_since = n
         self.draining_since = 0.0
         self.drain_deadline = 0.0
-        self.disabled_until = 0.0
         self.reset_breaker()
         if self.health in ("unknown", "dead"):
             self.health = "alive"
@@ -123,18 +110,6 @@ class Backend:
         self.lifecycle = "failed"
         self.record_failure(error, now=n)
 
-    def mark_detection(self, *, now: float | None = None) -> None:
-        """Enter detection zone: fast probing (10s) until one success."""
-        self.in_detection = True
-        self.detection_entered_at = now or time.time()
-
-    def exit_detection(self) -> None:
-        """Leave detection zone after a successful probe."""
-        self.in_detection = False
-        self.detection_entered_at = 0.0
-        self.consecutive_failures = 0
-        self.probe_consecutive_failures = 0
-
     # ───── health helpers ─────
 
     def record_success(self, *, now: float | None = None) -> None:
@@ -143,7 +118,6 @@ class Backend:
         self.last_probe_at = n
         self.last_success_at = n
         self.consecutive_failures = 0
-        self.probe_consecutive_failures = 0
         self.last_error = ""
         self.reset_breaker()
 
@@ -167,27 +141,10 @@ class Backend:
         else:
             self.health = "degraded"
 
-    def record_probe_failure(
-        self,
-        error: str,
-        *,
-        now: float | None = None,
-        cooldown_s: float = 30.0,
-        threshold: int = 3,
-    ) -> None:
-        """Record a liveness probe failure separately from traffic."""
-        self.probe_consecutive_failures += 1
-        self.record_failure(
-            error,
-            now=now,
-            cooldown_s=cooldown_s,
-            threshold=threshold,
-        )
-
     def status_label(self, now: float | None = None) -> str:
         """A single human-facing status richer than online/offline. Priority
-        order: user disable > draining > deploy-failed > breaker > detection >
-        inactive > active health."""
+        order: user disable > draining > deploy-failed > breaker > inactive >
+        active health."""
         n = now or time.time()
         if not self.enabled:
             return "disabled"
@@ -197,8 +154,6 @@ class Backend:
             return "failed"
         if self.is_open(n):
             return "circuit_open"
-        if self.in_detection:
-            return "detection"
         if self.lifecycle == "inactive":
             return "inactive"
         if self.lifecycle == "active":
@@ -213,8 +168,6 @@ class Backend:
         if not self.enabled:
             return False
         if self.lifecycle != "active":
-            return False
-        if self.in_detection:
             return False
         if self.is_open(now):
             return False

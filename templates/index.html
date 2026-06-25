@@ -1564,7 +1564,7 @@ function refreshGateway() {
       '<div class="stat-row"><span class="label">运行时长</span><span class="value">' + formatUptime(d.uptime || 0) + '</span></div>' +
       '<div class="stat-row"><span class="label">健康后端</span><span class="value">' + (d.backends_healthy || 0) + ' / ' + (d.backends_total || 0) + '</span></div>' +
       '<div class="stat-row"><span class="label">活跃 / 未路由</span><span class="value">' + (d.backends_active || 0) + ' / ' + (d.backends_inactive || 0) + '</span></div>' +
-      '<div class="stat-row"><span class="label">降级 / 检测中</span><span class="value" style="color:var(--yellow)">' + (d.backends_degraded || 0) + ' / ' + (d.backends_detection || 0) + '</span></div>' +
+      '<div class="stat-row"><span class="label">降级</span><span class="value" style="color:var(--yellow)">' + (d.backends_degraded || 0) + '</span></div>' +
       '<div class="stat-row"><span class="label">失败 / 排空</span><span class="value">' + (d.backends_failed || 0) + ' / ' + (d.backends_draining || 0) + '</span></div>';
     document.getElementById('gwPoolInfo').innerHTML =
       '<div class="stat-row"><span class="label">模式</span><span class="value">单活</span></div>' +
@@ -1617,7 +1617,6 @@ var BK_STATUS = {
   online: ['在线', 'var(--green)'],
   degraded: ['部分降级', 'var(--yellow)'],
   inactive: ['未路由', 'var(--text2)'],
-  detection: ['检测中', 'var(--yellow)'],
   circuit_open: ['熔断', 'var(--red)'],
   failed: ['失败', 'var(--red)'],
   dead: ['离线', 'var(--red)'],

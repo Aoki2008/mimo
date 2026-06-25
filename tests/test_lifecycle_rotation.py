@@ -22,7 +22,7 @@ def reset_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(config_store, "CONFIG_PATH", path)
     for name in (
         "_registry", "_router", "_transport", "_handler",
-        "_decision_log", "_probe_task", "_maintenance_task",
+        "_decision_log", "_probe_task",
     ):
         monkeypatch.setattr(runtime, name, None)
     monkeypatch.setattr(runtime, "_adapters", {})
@@ -192,16 +192,14 @@ def test_start_probe_does_not_attempt_removed_free_api_pool(monkeypatch, caplog)
         await asyncio.sleep(3600)
 
     monkeypatch.setattr(runtime, "_probe_loop", idle_loop)
-    monkeypatch.setattr(runtime, "_maintenance_loop", idle_loop)
 
     async def scenario():
         with caplog.at_level(logging.ERROR):
             runtime.start_probe()
             await asyncio.sleep(0)
 
-        tasks = [runtime._probe_task, runtime._maintenance_task]
+        tasks = [runtime._probe_task]
         monkeypatch.setattr(runtime, "_probe_task", None)
-        monkeypatch.setattr(runtime, "_maintenance_task", None)
         for task in tasks:
             if task is None:
                 continue
