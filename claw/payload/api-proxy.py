@@ -42,7 +42,7 @@ STREAM_IDLE_TIMEOUT = float(os.environ.get("PROXY_STREAM_IDLE_TIMEOUT", "120"))
 CONN_LIMIT = int(os.environ.get("PROXY_CONN_LIMIT", "200"))
 CONN_PER_HOST = int(os.environ.get("PROXY_CONN_PER_HOST", str(CONN_LIMIT)))
 PREWARM = int(os.environ.get("PROXY_PREWARM", "10"))
-DEFAULT_ENDPOINT = "https://api-oc.xiaomimimo.com"
+DEFAULT_ENDPOINT = "https://api-sgp-oc.xiaomimimo.com"
 
 _start = time.time()
 _reqs = 0
