@@ -999,13 +999,13 @@ def test_translate_audio_speech_request_builds_chat_payload():
 def test_translate_audio_speech_request_supports_mimo_v2_tts():
     payload = AudioSpeechRequest(
         input="你好",
-        model="mimo-v2-tts",
+        model="mimo-v2.5-tts",
         voice="mimo_meet",
         response_format="mp3",
     )
     translated = _translate_audio_speech_request(payload)
     assert translated == {
-        "model": "mimo-v2-tts",
+        "model": "mimo-v2.5-tts",
         "messages": [
             {"role": "assistant", "content": "你好"},
         ],

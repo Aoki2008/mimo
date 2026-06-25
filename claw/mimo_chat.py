@@ -9,7 +9,7 @@ MiMo Chat HTTP/SSE 客户端
   python3 mimo_chat.py --session my "1+1=?"      # 多轮对话
   python3 mimo_chat.py --thinking "解释量子计算"   # 深度思考
   python3 mimo_chat.py --quiet --usage "hello"   # 静默+用量
-  python3 mimo_chat.py --model mimo-v2-flash "hi" # 指定模型
+  python3 mimo_chat.py --model mimo-v2.5-pro "hi" # 指定模型
   python3 mimo_chat.py --list-conversations       # 列出所有会话
   python3 mimo_chat.py --history <convId>         # 查看会话历史
   python3 mimo_chat.py --user-info                # 用户信息
@@ -489,7 +489,7 @@ def main():
   %(prog)s "你好"                          # 单轮对话
   %(prog)s --session my "1+1=?"            # 多轮对话
   %(prog)s --thinking "解释量子计算"         # 深度思考
-  %(prog)s --model mimo-v2-flash "hi"      # 指定模型
+  %(prog)s --model mimo-v2.5-pro "hi"      # 指定模型
   %(prog)s --list-conversations            # 列出会话
   %(prog)s --history <convId>              # 查看历史
   %(prog)s --user-info                     # 用户信息

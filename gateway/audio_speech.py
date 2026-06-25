@@ -43,7 +43,6 @@ def map_openai_tts_model(model: Optional[str]) -> str:
         "tts-1": "mimo-v2.5-tts",
         "tts-1-hd": "mimo-v2.5-tts",
         "gpt-4o-mini-tts": "mimo-v2.5-tts",
-        "mimo-v2-tts": "mimo-v2-tts",
         "mimo-v2.5-tts": "mimo-v2.5-tts",
         "mimo-v2.5-tts-voicedesign": "mimo-v2.5-tts-voicedesign",
         "mimo-v2.5-tts-voiceclone": "mimo-v2.5-tts-voiceclone",

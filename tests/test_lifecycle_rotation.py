@@ -362,23 +362,29 @@ def test_abort_account_deploy_marks_unrestorable_backend_failed(monkeypatch):
     assert old.lifecycle == "failed"
 
 
-def test_probeable_models_excludes_tts_and_asr():
+def test_probeable_models_restricts_to_v25_chat():
     b = _backend("x")
     b.models = [
         "mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5-tts",
         "mimo-v2.5-tts-voiceclone", "mimo-v2.5-asr", "mimo-v2-omni",
     ]
-    assert runtime._probeable_models(b) == [
-        "mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2-omni",
-    ]
+    # tts/asr dropped; among the remaining chat models only the v2.5 family is
+    # probed (older v2-flash/omni skipped, no fallback to them).
+    assert runtime._probeable_models(b) == ["mimo-v2.5-pro"]
 
 
-def test_probe_model_uses_first_probeable_not_hardcoded_flash():
+def test_probeable_models_empty_when_no_v25_chat_model():
     b = _backend("x")
-    b.models = ["mimo-v2.5-pro", "mimo-v2-flash"]
+    b.models = ["mimo-v2-flash", "mimo-v2-omni", "mimo-v2.5-tts"]
+    # No v2.5 *chat* model (v2.5-tts is excluded) and the older v2 models are
+    # delisted, so there is nothing to probe — no fallback.
+    assert runtime._probeable_models(b) == []
+
+
+def test_probe_model_picks_v25_over_legacy_v2():
+    b = _backend("x")
+    b.models = ["mimo-v2-flash", "mimo-v2.5-pro"]
     assert runtime._probe_model(b) == "mimo-v2.5-pro"
-    b.models = ["mimo-v2.5-tts", "mimo-v2-omni"]
-    assert runtime._probe_model(b) == "mimo-v2-omni"
 
 
 def test_health_degrades_then_dies_then_recovers():

@@ -69,11 +69,22 @@ _PROBE_PROMPT = "ping"
 # so they are excluded from liveness probing.
 _NON_CHAT_MODEL_RE = re.compile(r"(tts|asr)", re.IGNORECASE)
 
+# Liveness probing is restricted to the v2.5 family (e.g. mimo-v2.5-pro). The
+# older v2 models (v2-flash/omni/pro) are delisted upstream, so they are never
+# probed and there is no fallback to them.
+_PROBE_MODEL_RE = re.compile(r"v2\.5", re.IGNORECASE)
+
 
 def _probeable_models(backend: Backend) -> list[str]:
-    """The backend's models minus non-chat (tts/asr) ones — we probe every one
-    of these (no single hardcoded probe model)."""
-    return [m for m in backend.models if m and not _NON_CHAT_MODEL_RE.search(m)]
+    """v2.5-family chat models to liveness-probe.
+
+    Excludes non-chat (tts/asr) models and keeps only the v2.5 family. The older
+    v2 models are delisted upstream, so there is no fallback to them — a backend
+    exposing no v2.5 chat model simply has nothing to probe."""
+    return [
+        m for m in backend.models
+        if m and _PROBE_MODEL_RE.search(m) and not _NON_CHAT_MODEL_RE.search(m)
+    ]
 
 # ────────────── singleton state ──────────────
 
@@ -265,9 +276,6 @@ async def _dispatch_preparsed(adapter_name: str, request: Request, body: dict[st
     assert _handler is not None
     adapter = _adapters[adapter_name]
 
-    from gateway.probe_dump import dump_inbound, dump_outbound, tee_stream
-    dump_inbound(adapter_name, body)
-
     ctx = _ctx_from_request(request, adapter)
     _total_requests += 1
 
@@ -285,10 +293,9 @@ async def _dispatch_preparsed(adapter_name: str, request: Request, body: dict[st
     if stream_iter is not None:
         headers["Cache-Control"] = "no-cache"
         return StreamingResponse(
-            tee_stream(adapter_name, stream_iter),
+            stream_iter,
             media_type=content_type, headers=headers,
         )
-    dump_outbound(adapter_name, body_bytes)
     return Response(content=body_bytes, media_type=content_type, status_code=200, headers=headers)
 
 
@@ -581,9 +588,8 @@ async def _probe_loop() -> None:
             return
         started = time.monotonic()
         try:
-            # Try each chat-capable model until one answers: MiMo lists models
-            # (e.g. mimo-v2-flash/omni) that /v1/chat/completions rejects as
-            # "Not supported", which must not fail an otherwise-healthy backend.
+            # Probe the v2.5 chat model(s); stop at the first that answers. The
+            # backend may list several v2.5 variants, so try each until one is OK.
             ok, reason = False, "no probeable models"
             for _m in _probeable_models(backend):
                 ok, reason = await _run_one_probe_check(backend, "probe", _probe_body_for_model(_m))

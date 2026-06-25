@@ -706,7 +706,11 @@ def _ssh_bootstrap_instructions() -> str:
         f"nohup python {scripts}/api-proxy.py >/tmp/api-proxy.log 2>&1 &`\n"
         f"5. 起反向隧道（公钥被授权前一直重试是正常的）："
         f"`pkill -f 'bash {scripts}/reverse-tunnel.sh' 2>/dev/null||true; nohup bash {scripts}/reverse-tunnel.sh >/tmp/reverse-tunnel.log 2>&1 &`\n"
-        f"6. 最后把公钥发我：`cat {sshdir}/id_tunnel.pub`"
+        f"6. 装定时自检（每 2 分钟跑一次看门狗，掉了自动拉起，幂等安全）：先确保 cron 在跑"
+        f"`service cron start 2>/dev/null || cron 2>/dev/null || crond 2>/dev/null || true`；"
+        f"再写 crontab（去重）：`( crontab -l 2>/dev/null | grep -v tunnel-keepalive.sh; "
+        f"echo '*/2 * * * * bash {scripts}/tunnel-keepalive.sh >/dev/null 2>&1' ) | crontab -`\n"
+        f"7. 最后把公钥发我：`cat {sshdir}/id_tunnel.pub`"
     )
 
 

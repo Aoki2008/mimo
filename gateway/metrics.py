@@ -17,6 +17,7 @@ import queue
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -840,3 +841,171 @@ def get_public_hourly(hours: int = 24) -> list[dict]:
         return result
     except Exception:
         return []
+
+
+def get_public_window(hours: int = 24) -> dict:
+    """Windowed summary safe to expose publicly (default: last 24h).
+
+    Unlike ``get_public_totals`` (all-time), this rolls up just the recent
+    window so a status page can show "last 24h" headline numbers alongside the
+    all-time counters. Latency / TTFT percentiles are scoped to the same window.
+    """
+    hours = max(1, min(int(hours), 168))
+    empty = {
+        "hours": hours,
+        "requests": 0,
+        "successful": 0,
+        "errors": 0,
+        "success_rate": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "streaming_requests": 0,
+        "non_streaming_requests": 0,
+        "latency": {"p50": 0, "p95": 0, "p99": 0, "avg": 0},
+        "ttft": {"p50": 0, "p95": 0, "p99": 0, "avg": 0},
+    }
+    try:
+        conn = _get_thread_conn()
+        since = time.time() - hours * 3600
+        row = conn.execute(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN status_code BETWEEN 200 AND 399 THEN 1 ELSE 0 END), "
+            "SUM(prompt_tokens), SUM(completion_tokens), "
+            "SUM(CASE WHEN is_stream THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN is_stream THEN 0 ELSE 1 END) "
+            "FROM requests WHERE ts >= ?",
+            (since,),
+        ).fetchone()
+        total = row[0] or 0
+        success = row[1] or 0
+        prompt = row[2] or 0
+        completion = row[3] or 0
+        latency = _metric_distribution(
+            conn, "latency_ms",
+            "ts >= ? AND latency_ms > 0 AND status_code BETWEEN 200 AND 399",
+            (since,),
+        )
+        ttft = _metric_distribution(
+            conn, "ttft_ms",
+            "ts >= ? AND ttft_ms > 0 AND status_code BETWEEN 200 AND 399",
+            (since,),
+        )
+        return {
+            "hours": hours,
+            "requests": total,
+            "successful": success,
+            "errors": total - success,
+            "success_rate": round(success / max(total, 1) * 100, 2),
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+            "streaming_requests": row[4] or 0,
+            "non_streaming_requests": row[5] or 0,
+            "latency": latency,
+            "ttft": ttft,
+        }
+    except Exception:
+        return empty
+
+
+def get_public_daily(days: int = 30) -> list[dict]:
+    """Daily request aggregates for the last *days* days (Beijing calendar day).
+
+    Coarser companion to ``get_public_hourly`` for a long-range trend strip.
+    Each entry carries request counts, success rate, token totals and a
+    status-page state. Zero-filled and sorted oldest-first. No backend
+    identities are exposed.
+    """
+    try:
+        days = max(1, min(int(days), 365))
+        conn = _get_thread_conn()
+        since = time.time() - days * 86400
+        # Bucket by Beijing calendar day so it matches the create-quota / relay
+        # day boundary used elsewhere (UTC+8), independent of the host timezone.
+        day_expr = "date(ts + 28800, 'unixepoch')"  # +8h then take the date
+        rows = conn.execute(
+            "SELECT "
+            f"  {day_expr} AS day, "
+            "  COUNT(*), "
+            "  SUM(CASE WHEN status_code BETWEEN 200 AND 399 THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN status_code < 200 OR status_code > 399 THEN 1 ELSE 0 END), "
+            "  AVG(latency_ms), "
+            "  AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END), "
+            "  SUM(prompt_tokens + completion_tokens) "
+            "FROM requests "
+            "WHERE ts >= ? "
+            "GROUP BY day "
+            "ORDER BY day",
+            (since,),
+        ).fetchall()
+
+        by_day: dict[str, dict] = {}
+        for r in rows:
+            requests = r[1] or 0
+            success = r[2] or 0
+            success_rate = round(success / max(requests, 1) * 100, 2)
+            p95_latency = _single_percentile(
+                conn, "latency_ms",
+                f"{day_expr} = ? AND latency_ms > 0",
+                (r[0],), 0.95,
+            )
+            by_day[str(r[0])] = {
+                "date": str(r[0]),
+                "requests": requests,
+                "success": success,
+                "fail": r[3] or 0,
+                "success_rate": success_rate,
+                "avg_latency": round(r[4] or 0, 1),
+                "p95_latency": p95_latency,
+                "avg_ttft": round(r[5] or 0, 1),
+                "tokens": r[6] or 0,
+                "status": _availability_status(requests, success_rate, p95_latency),
+            }
+
+        # Zero-fill missing days so the front-end draws a continuous strip.
+        result: list[dict] = []
+        today_beijing = (
+            datetime.fromtimestamp(time.time() + 28800, timezone.utc).date()
+        )
+        for i in range(days - 1, -1, -1):
+            d = (today_beijing - timedelta(days=i)).isoformat()
+            result.append(by_day.get(d, {
+                "date": d, "requests": 0, "success": 0, "fail": 0,
+                "success_rate": 0, "avg_latency": 0, "p95_latency": 0,
+                "avg_ttft": 0, "tokens": 0, "status": "no_data",
+            }))
+        return result
+    except Exception:
+        return []
+
+
+def compute_uptime(hourly: list[dict], hours: int) -> float | None:
+    """Status-page uptime % over the last ``hours`` of an hourly series.
+
+    ``hourly`` is the output of :func:`get_public_hourly` (oldest-first). Each
+    bucket with traffic counts toward the denominator; ``operational`` buckets
+    are full credit, ``degraded`` half credit, ``major_outage`` none. Returns
+    ``None`` when there is no traffic in the window (distinct from 0% outage).
+
+    This is intentionally distinct from raw success-rate: it answers "what
+    fraction of the recent hours was the service healthy", which is what a
+    status page reports as uptime.
+    """
+    if not hourly or hours <= 0:
+        return None
+    window = hourly[-hours:]
+    credit = 0.0
+    tracked = 0
+    for b in window:
+        if (b.get("requests") or 0) <= 0:
+            continue
+        tracked += 1
+        status = b.get("status")
+        if status == "operational":
+            credit += 1.0
+        elif status == "degraded":
+            credit += 0.5
+    if tracked == 0:
+        return None
+    return round(credit / tracked * 100, 2)

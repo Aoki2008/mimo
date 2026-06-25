@@ -1922,16 +1922,6 @@ async def auto_deploy_history(account_filename: str):
     return {"history": get_run_history(account_filename)}
 
 
-@app.get("/api/claw-activity/status")
-async def claw_activity_status():
-    """Per-account human-like WS maintenance state: what we last sent each
-    Claw, what it replied, health, and next-due countdown."""
-    try:
-        from claw.claw_activity import get_activity_status
-        return get_activity_status()
-    except Exception as e:  # noqa: BLE001
-        return {"running": False, "accounts": {}, "error": f"{type(e).__name__}: {e}"}
-
 
 # ──────────── Gateway API endpoints ────────────
 
@@ -2088,7 +2078,15 @@ async def public_status(request: Request, key: str = ""):
     Requires the dedicated ``status_api_token`` (NOT the API or panel token),
     via ``Authorization: Bearer <token>`` / ``X-Status-Key`` header or ``?key=``.
     Returns only curated, non-sensitive aggregates — no backend names or keys.
-    The public hourly series covers the last 48 hours."""
+
+    Sections (see the ``windows`` map in the response for each one's range):
+      * all-time totals + latency/ttft percentiles
+      * ``window_24h`` — last-24h rollup (requests/success/tokens/latency/ttft)
+      * ``status_codes`` / ``models`` / ``routes`` — last 24h
+      * ``hourly`` — last 48h buckets; ``daily`` — last 30 days
+      * ``uptime`` — status-page availability % over 24h / 48h
+      * ``status`` / ``backends_online`` — live snapshot; ``generated_at`` epoch
+    """
     expected = _secrets.status_api_token
     auth = request.headers.get("authorization", "")
     bearer = auth[7:].strip() if auth.startswith("Bearer ") else ""
@@ -2096,9 +2094,22 @@ async def public_status(request: Request, key: str = ""):
     if not expected or not supplied or not hmac.compare_digest(supplied, expected):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     try:
-        from gateway.metrics import get_public_totals, get_public_hourly
+        from gateway.metrics import (
+            get_public_totals,
+            get_public_hourly,
+            get_public_window,
+            get_public_daily,
+            compute_uptime,
+        )
         data = get_public_totals()
-        data["hourly"] = get_public_hourly(hours=48)
+        hourly = get_public_hourly(hours=48)
+        data["hourly"] = hourly
+        data["window_24h"] = get_public_window(hours=24)
+        data["daily"] = get_public_daily(days=30)
+        data["uptime"] = {
+            "24h": compute_uptime(hourly, 24),
+            "48h": compute_uptime(hourly, 48),
+        }
     except ImportError:
         data = {
             "total_requests": 0,
@@ -2115,6 +2126,9 @@ async def public_status(request: Request, key: str = ""):
             "models": [],
             "routes": [],
             "hourly": [],
+            "window_24h": {},
+            "daily": [],
+            "uptime": {"24h": None, "48h": None},
         }
     # Operational summary (counts only — never expose backend identities).
     operational, online = True, 0
@@ -2130,6 +2144,20 @@ async def public_status(request: Request, key: str = ""):
         pass
     data["status"] = "operational" if operational else "degraded"
     data["backends_online"] = online
+    data["generated_at"] = int(time.time())
+    # Window labels so external consumers know what each section covers without
+    # guessing (totals/latency are all-time; status_codes/models/routes are 24h).
+    data["windows"] = {
+        "totals": "all_time",
+        "latency": "all_time",
+        "ttft": "all_time",
+        "window_24h": "24h",
+        "status_codes": "24h",
+        "models": "24h",
+        "routes": "24h",
+        "hourly": "48h",
+        "daily": "30d",
+    }
     return data
 
 

@@ -10,7 +10,6 @@ from gateway.core import BadRequestError, InternalRequest
 # by these multimodal models.
 IMAGE_INPUT_MODELS = frozenset({
     "mimo-v2.5",
-    "mimo-v2-omni",
 })
 
 

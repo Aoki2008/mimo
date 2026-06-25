@@ -308,17 +308,17 @@ def test_openai_image_request_rejected_for_text_model_before_routing(monkeypatch
 
 def test_openai_image_request_allowed_for_mimo_multimodal_model(monkeypatch):
     monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
-    backend = Backend(backend_id="a", base_url="http://a", models=["mimo-v2-omni"])
+    backend = Backend(backend_id="a", base_url="http://a", models=["mimo-v2.5"])
     backend.record_success()
     transport = FakeTransport({
-        "http://a/v1/chat/completions": (200, _payload("mimo-v2-omni")),
+        "http://a/v1/chat/completions": (200, _payload("mimo-v2.5")),
     })
     handler = GatewayHandler(
         router=Router(BackendRegistry([backend])),
         transport=transport,
     )
     body = {
-        "model": "mimo-v2-omni",
+        "model": "mimo-v2.5",
         "messages": [{
             "role": "user",
             "content": [
