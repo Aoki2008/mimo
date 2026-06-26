@@ -1455,54 +1455,78 @@ function renderAutoDeployAccounts(deployCfg) {
 }
 
 function renderAutoDeployList(el, deployCfg, scheduler) {
-  var html = '';
+  var head = '';
   var counts = scheduler.counts || {};
   if (counts.enabled_accounts) {
-    html += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px;font-size:0.78rem">';
-    html += '<span>启用：<b>' + counts.enabled_accounts + '</b></span>';
-    html += '<span>Active：<b style="color:var(--green)">' + (counts.active_selectable || 0) + '</b></span>';
-    html += '<span>目标：<b>' + (counts.desired_active || 0) + '</b></span>';
-    html += '<span>最低：<b>' + (counts.normal_min_active || 0) + '</b></span>';
-    if (counts.emergency_min_active) html += '<span>紧急下限：<b>' + counts.emergency_min_active + '</b></span>';
-    html += '</div>';
+    head += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px;font-size:0.78rem">';
+    head += '<span>启用：<b>' + counts.enabled_accounts + '</b></span>';
+    head += '<span>Active：<b style="color:var(--green)">' + (counts.active_selectable || 0) + '</b></span>';
+    head += '<span>目标：<b>' + (counts.desired_active || 0) + '</b></span>';
+    head += '<span>最低：<b>' + (counts.normal_min_active || 0) + '</b></span>';
+    if (counts.emergency_min_active) head += '<span>紧急下限：<b>' + counts.emergency_min_active + '</b></span>';
+    head += '</div>';
   }
+  var normalHtml = '', riskHtml = '', nNormal = 0, nRisk = 0;
   for (var i = 0; i < window.accounts.length; i++) {
     var a = window.accounts[i];
     var fn = a.filename;
     var cfg = (deployCfg && deployCfg[fn]) || {};
     var enabled = cfg.enabled || false;
+    var isRisk = !!cfg.risk_blocked;
     var badge = enabled
       ? '<span style="background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:4px;font-size:0.72rem">已启用</span>'
       : '<span style="background:#222;color:#666;padding:2px 8px;border-radius:4px;font-size:0.72rem">已禁用</span>';
+    if (isRisk) badge += ' <span class="badge-risk">🚫 ' + (cfg.risk_kind === 'create_gate' ? '建号风控' : '风控') + '隔离</span>';
 
-    html += '<div style="background:#0d1b2a;border-radius:8px;padding:16px;margin-bottom:12px;border:1px solid ' + (enabled ? 'rgba(34,197,94,.3)' : 'var(--border)') + '">';
-    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">';
-    html += '<div><strong>' + escapeHtml(fn) + '</strong> ' + badge + '</div>';
-    html += '<div class="btn-group" style="margin-top:0">';
-    html += '<button class="btn btn-success" onclick="triggerAutoDeploy(\'' + fn + '\')">立即运行</button>';
-    html += '<button class="btn btn-danger" onclick="cancelAutoDeploy(\'' + fn + '\')">取消</button>';
-    html += '<button class="btn btn-ghost" onclick="showDeployLog(\'' + fn + '\')">日志</button>';
-    html += '</div></div>';
-    html += '<div style="margin-bottom:10px">';
-    html += '<label style="font-size:0.78rem;color:var(--text3)">启用</label> ';
-    html += '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="updateAccountDeploy(\'' + fn + '\',\'enabled\',this.checked)" style="width:auto;margin-left:6px;vertical-align:middle">';
-    html += '<span style="font-size:0.74rem;color:var(--text3);margin-left:12px">自动接力：约 4h TTL，剩余约 30 分钟冷启动下一个可用账号，无需 Cron</span>';
-    html += '</div>';
+    var card = '<div style="background:#0d1b2a;border-radius:8px;padding:16px;margin-bottom:12px;border:1px solid ' + (isRisk ? 'var(--red)' : (enabled ? 'rgba(34,197,94,.3)' : 'var(--border)')) + (isRisk ? ';box-shadow:0 0 0 1px rgba(239,68,68,.25)' : '') + '">';
+    card += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">';
+    card += '<div><strong>' + escapeHtml(fn) + '</strong> ' + badge + '</div>';
+    card += '<div class="btn-group" style="margin-top:0">';
+    card += '<button class="btn btn-success" onclick="triggerAutoDeploy(\'' + fn + '\')">立即运行</button>';
+    card += '<button class="btn btn-danger" onclick="cancelAutoDeploy(\'' + fn + '\')">取消</button>';
+    card += '<button class="btn btn-ghost" onclick="showDeployLog(\'' + fn + '\')">日志</button>';
+    card += '</div></div>';
+    if (isRisk) card += '<div class="risk-reason">🚫 已风控隔离' + (cfg.risk_kind === 'create_gate' ? '（建号 create 被拒）' : '') + '：' + escapeHtml(cfg.risk_blocked_reason || '账号存在风险') + ' · 每 2h 自动复测，解除后自动放回可用池</div>';
+    card += '<div style="margin-bottom:10px">';
+    card += '<label style="font-size:0.78rem;color:var(--text3)">启用</label> ';
+    card += '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="updateAccountDeploy(\'' + fn + '\',\'enabled\',this.checked)" style="width:auto;margin-left:6px;vertical-align:middle">';
+    card += '<span style="font-size:0.74rem;color:var(--text3);margin-left:12px">自动接力：约 4h TTL，剩余约 30 分钟冷启动下一个可用账号，无需 Cron</span>';
+    card += '</div>';
     var schedInfo = (scheduler.accounts && scheduler.accounts[fn]) || {};
     var lastRun = schedInfo.last_run || (cfg.last_run ? new Date(cfg.last_run * 1000).toLocaleString('zh-CN') : '从未');
     var ageMin = schedInfo.age_min || 0;
     var relayReason = schedInfo.next_relay_reason || '';
     var skipReason = schedInfo.skip_reason || '';
-    html += '<div style="display:flex;gap:20px;margin-bottom:10px;font-size:0.78rem;color:var(--text3)">';
-    html += '<span>上次：<b style="color:var(--text2)">' + escapeHtml(String(lastRun)) + '</b></span>';
-    if (ageMin > 0) html += '<span>年龄：<b style="color:' + (ageMin >= 230 ? 'var(--red)' : ageMin >= 210 ? 'var(--yellow)' : 'var(--text2)') + '">' + ageMin + ' 分钟</b></span>';
-    if (relayReason && relayReason !== 'fresh' && relayReason !== 'disabled') html += '<span>接力原因：<b>' + escapeHtml(relayReason) + '</b></span>';
-    if (skipReason && skipReason !== 'disabled') html += '<span style="color:var(--yellow)">跳过：' + escapeHtml(skipReason) + '</span>';
-    html += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
-    html += '</div>';
-    html += '</div>';
+    card += '<div style="display:flex;gap:20px;margin-bottom:10px;font-size:0.78rem;color:var(--text3)">';
+    card += '<span>上次：<b style="color:var(--text2)">' + escapeHtml(String(lastRun)) + '</b></span>';
+    if (ageMin > 0) card += '<span>年龄：<b style="color:' + (ageMin >= 230 ? 'var(--red)' : ageMin >= 210 ? 'var(--yellow)' : 'var(--text2)') + '">' + ageMin + ' 分钟</b></span>';
+    if (relayReason && relayReason !== 'fresh' && relayReason !== 'disabled') card += '<span>接力原因：<b>' + escapeHtml(relayReason) + '</b></span>';
+    if (skipReason && skipReason !== 'disabled') card += '<span style="color:var(--yellow)">跳过：' + escapeHtml(skipReason) + '</span>';
+    card += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
+    card += '</div>';
+    card += '</div>';
+    if (isRisk) { riskHtml += card; nRisk++; } else { normalHtml += card; nNormal++; }
   }
-  el.innerHTML = html;
+  if (nNormal === 0) normalHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无正常账号（全部在风控隔离分页）</div>';
+  if (nRisk === 0) riskHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无风控隔离账号 🎉</div>';
+  var tabs = '<div style="display:flex;gap:8px;margin-bottom:14px">' +
+    '<button id="adTabBtnNormal" class="btn btn-primary" onclick="switchAdTab(\'normal\')">正常账号 (' + nNormal + ')</button>' +
+    '<button id="adTabBtnRisk" class="btn btn-ghost" onclick="switchAdTab(\'risk\')">🚫 风控隔离 (' + nRisk + ')</button>' +
+    '</div>';
+  el.innerHTML = head + tabs +
+    '<div id="adTabNormal">' + normalHtml + '</div>' +
+    '<div id="adTabRisk" style="display:none">' + riskHtml + '</div>';
+}
+
+function switchAdTab(which) {
+  var n = document.getElementById('adTabNormal'), r = document.getElementById('adTabRisk');
+  var bn = document.getElementById('adTabBtnNormal'), br = document.getElementById('adTabBtnRisk');
+  if (!n || !r) return;
+  var risk = (which === 'risk');
+  n.style.display = risk ? 'none' : '';
+  r.style.display = risk ? '' : 'none';
+  if (bn) bn.className = 'btn ' + (risk ? 'btn-ghost' : 'btn-primary');
+  if (br) br.className = 'btn ' + (risk ? 'btn-primary' : 'btn-ghost');
 }
 
 function updateAccountDeploy(filename, key, value) {
