@@ -112,6 +112,11 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
 /* Account cards */
 .acc-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px}
 .acc-card.current{border-color:var(--accent);box-shadow:0 0 0 1px rgba(59,130,246,.2)}
+.acc-card.risk{border-color:var(--red);box-shadow:0 0 0 1px rgba(239,68,68,.4);background:linear-gradient(0deg,rgba(239,68,68,.07),rgba(239,68,68,.07)),var(--card)}
+.acc-card.risk .name::before{content:"🚫 "}
+.badge-risk{background:var(--red);color:#fff;font-weight:700;font-size:0.8rem;padding:3px 10px;border-radius:5px;display:inline-block;box-shadow:0 0 8px rgba(239,68,68,.45)}
+.risk-reason{margin:2px 0 10px;padding:8px 11px;background:var(--red-bg);border:1px solid var(--red);border-radius:6px;color:#fca5a5;font-size:0.79rem;line-height:1.45}
+tr.row-risk td{background:rgba(239,68,68,.09)}
 .acc-card .head{display:flex;justify-content:space-between;align-items:start;margin-bottom:10px;gap:12px;flex-wrap:wrap}
 .acc-card .name{font-weight:700;font-size:1.02rem;color:var(--text)}
 .acc-card .badges{display:flex;gap:6px;flex-wrap:wrap}
@@ -316,6 +321,10 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
         <div class="metric-card">
           <div class="metric-value" id="dashCookieValid">--</div>
           <div class="metric-label">Cookie 有效</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="dashRiskCount" style="color:var(--red)">--</div>
+          <div class="metric-label">风控隔离</div>
         </div>
         <div class="metric-card">
           <div class="metric-value" id="dashGwBackends">--</div>
@@ -941,24 +950,29 @@ function _dashClawBadge(s) {
 }
 function _dashPoolBadge(s) {
   if (!s) return '<span class="status-text" style="color:var(--text3)">…</span>';
-  if (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED'))
-    return '<span class="status-text error" title="' + escapeHtml(s.banned_status || 'risk') + '">风控</span>';
+  if (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED')) {
+    var _rk = s.risk_kind === 'create_gate' ? '建号风控' : ((s.banned_status && s.banned_status !== 'NOT_BANNED') ? '封禁' : '风控');
+    return '<span class="badge-risk" title="' + escapeHtml(s.risk_reason || s.banned_status || 'risk') + '">🚫 ' + _rk + '隔离</span>';
+  }
   if (s.pool === 'disabled') return '<span class="status-text" style="color:var(--text3)">停用</span>';
   if (s.in_cooldown || s.pool === 'cooldown') return '<span class="status-text warning">冷却</span>';
   if (s.pool === 'available') return '<span class="status-text ok">可用</span>';
   return '<span class="status-text" style="color:var(--text3)">--</span>';
 }
 function _dashRetallyCounters() {
-  var clawHealthy = 0, cookieValid = 0;
+  var clawHealthy = 0, cookieValid = 0, riskCount = 0;
   for (var i = 0; i < accounts.length; i++) {
     var s = accountSummaries[accounts[i].filename];
     if (s) {
       if (s.claw_status === 'AVAILABLE') clawHealthy++;
       if (s.cookie_valid) cookieValid++;
+      if (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED')) riskCount++;
     }
   }
   document.getElementById('dashClawHealthy').textContent = clawHealthy + ' / ' + accounts.length;
   document.getElementById('dashCookieValid').textContent = cookieValid + ' / ' + accounts.length;
+  var rc = document.getElementById('dashRiskCount');
+  if (rc) { rc.textContent = riskCount; rc.style.color = riskCount > 0 ? 'var(--red)' : 'var(--text3)'; }
 }
 
 function refreshDashboard() {
@@ -1000,6 +1014,7 @@ function refreshDashboard() {
       if (ckCell) ckCell.innerHTML = _dashCkBadge(s);
       if (clawCell) clawCell.innerHTML = _dashClawBadge(s);
       if (poolCell) poolCell.innerHTML = _dashPoolBadge(s);
+      if (s && (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED'))) row.classList.add('row-risk'); else row.classList.remove('row-risk');
       if (expCell) expCell.textContent = (s && s.claw_expire) || '--';
       if (userCell && s) {
         userCell.innerHTML = escapeHtml(s.user_name || '--') +
@@ -1061,20 +1076,23 @@ function renderAccountCards() {
               ? '<span class="status-text error">Claw ' + escapeHtml(s.claw_status) + '</span>'
               : '<span class="status-text warning">Claw 待检</span>'));
     var curBadge = a.is_current ? '<span class="status-text ok">当前账号</span>' : '';
-    var poolBadge = (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED'))
-      ? '<span class="status-text error">风控</span>'
+    var _isRisk = (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED'));
+    var _riskKind = s.risk_kind === 'create_gate' ? '建号风控' : ((s.banned_status && s.banned_status !== 'NOT_BANNED') ? '封禁' : '风控');
+    var poolBadge = _isRisk
+      ? '<span class="badge-risk" title="' + escapeHtml(s.risk_reason || s.banned_status || '') + '">🚫 ' + _riskKind + '隔离</span>'
       : (s.in_cooldown || s.pool === 'cooldown'
           ? '<span class="status-text warning">冷却</span>'
           : (s.pool === 'available'
               ? '<span class="status-text ok">可用</span>'
               : (s.pool === 'disabled' ? '<span class="status-text" style="color:var(--text3)">停用</span>' : '')));
     var fn = a.filename;
-    html += '<div class="acc-card' + (a.is_current ? ' current' : '') + '" id="acccard-' + escapeHtml(fn) + '">';
+    html += '<div class="acc-card' + (a.is_current ? ' current' : '') + (_isRisk ? ' risk' : '') + '" id="acccard-' + escapeHtml(fn) + '">';
     html += '<div class="head">';
     html += '<div><div class="name">' + escapeHtml(a.name || fn) + '</div>';
     html += '<div style="font-size:0.74rem;color:var(--text3);margin-top:2px">' + escapeHtml(fn) + '</div></div>';
     html += '<div class="badges">' + curBadge + poolBadge + ckBadge + clawBadge + '</div>';
     html += '</div>';
+    if (_isRisk) html += '<div class="risk-reason">🚫 已风控隔离' + (s.risk_kind === 'create_gate' ? '（建号 create 被拒）' : '') + '：' + escapeHtml(s.risk_reason || s.banned_status || '账号存在风险') + '</div>';
     html += '<div class="meta-row">';
     html += '<div><span class="k">用户名</span><span class="v">' + escapeHtml(s.user_name || a.user_name || '--') + '</span></div>';
     html += '<div><span class="k">User ID</span><span class="v">' + escapeHtml(s.user_id || a.user_id || '--') + '</span></div>';

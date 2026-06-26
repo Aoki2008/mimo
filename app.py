@@ -929,6 +929,8 @@ def _account_pool_state(filename: str) -> dict:
     return {
         "pool": pool,
         "risk_blocked": risk_blocked,
+        "risk_kind": acc.get("risk_kind") or "",
+        "risk_reason": acc.get("risk_blocked_reason") or "",
         "in_cooldown": in_cooldown,
         "last_create_at": last,
     }
@@ -1505,6 +1507,8 @@ async def account_summary(filename: str):
         "claw_cluster": claw_view.get("clusterKey", ""),
         "pool": pool_state["pool"],
         "risk_blocked": pool_state["risk_blocked"],
+        "risk_kind": pool_state.get("risk_kind", ""),
+        "risk_reason": pool_state.get("risk_reason", ""),
         "in_cooldown": pool_state["in_cooldown"],
         "last_create_at": pool_state["last_create_at"],
         "is_current": filename == _get_current_account_name(),
